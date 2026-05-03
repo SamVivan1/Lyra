@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  music-automation:
+    build: .
+    container_name: music-automation
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - /mnt/Storage2/data/media/Music:/mnt/Storage2/data/media/Music
+      - /DATA/Downloads:/DATA/Downloads
+      # Mount the database directory so the SQLite state is persistent
+      - ./data:/app/data
+    environment:
+      - DB_PATH=/app/data/music_automation.db
+      - TZ=UTC # Change to your timezone if needed
