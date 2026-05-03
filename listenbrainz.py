@@ -16,48 +16,77 @@ class ListenBrainzClient:
         if self.token:
             self.headers["Authorization"] = f"Token {self.token}"
 
-    def _recommendation_urls(self):
-        return [
-            f"{self.base_url}/recommendation/user/{self.username}/recording",
-            f"{self.base_url}/recommendation/user/{self.username}"
-        ]
+    def _recommendation_url(self):
+        return f"{self.base_url}/cf/recommendation/user/{self.username}/recording"
 
-    def get_recommended_artists(self):
-        """Fetch recommended artists from ListenBrainz for the configured user."""
+    def _musicbrainz_recording_url(self, recording_mbid):
+        return f"https://musicbrainz.org/ws/2/recording/{recording_mbid}"
+
+    def get_recommended_recording_mbids(self, count=10, offset=0):
+        """Fetch recommended recording MBIDs from ListenBrainz for the configured user."""
         if not self.username:
             logger.error("ListenBrainz username is not configured.")
             return []
 
-        artists = set()
-        recordings = []
-        for url in self._recommendation_urls():
-            logger.info(f"Fetching recommendations from {url}")
-            try:
-                rate_limit()
-                response = requests.get(url, headers=self.headers, timeout=10)
-                if response.status_code == 404:
-                    logger.warning(f"ListenBrainz endpoint not found: {url}")
-                    continue
-                response.raise_for_status()
+        url = self._recommendation_url()
+        params = {"count": count, "offset": offset}
+        logger.info(f"Fetching recording recommendations from {url}")
 
-                data = response.json()
-                recordings = data.get("payload", {}).get("recordings", [])
-                if recordings:
-                    break
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Error fetching recommendations from ListenBrainz: {e}")
+        try:
+            rate_limit()
+            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+            if response.status_code == 204:
+                logger.info("ListenBrainz returned 204 No Content for recording recommendations.")
                 return []
+            response.raise_for_status()
 
-        if not recordings:
-            logger.info("No recommendation recordings found from ListenBrainz.")
+            data = response.json()
+            mbids = [item.get("recording_mbid") for item in data.get("payload", {}).get("mbids", []) if item.get("recording_mbid")]
+            return mbids
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching recording recommendations from ListenBrainz: {e}")
             return []
 
-        for rec in recordings:
-            artist_credits = rec.get("artist_credit", [])
-            for ac in artist_credits:
-                artist_name = ac.get("artist_name")
-                if artist_name:
-                    artists.add(artist_name)
+    def get_recording_artist_names(self, recording_mbid):
+        """Resolve a ListenBrainz recording MBID to artist names via MusicBrainz."""
+        url = self._musicbrainz_recording_url(recording_mbid)
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "MusicAutomation/1.0 ( homelab deployment )"
+        }
+        params = {"fmt": "json", "inc": "artist-credits"}
+
+        try:
+            rate_limit()
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+            artist_names = []
+            for ac in data.get("artist-credit", []):
+                if isinstance(ac, dict):
+                    artist = ac.get("artist", {})
+                    name = artist.get("name") or ac.get("name")
+                    if name:
+                        artist_names.append(name)
+                elif isinstance(ac, str):
+                    artist_names.append(ac)
+            return artist_names
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to resolve recording {recording_mbid} metadata: {e}")
+            return []
+
+    def get_recommended_artists(self):
+        """Fetch recommended artists from ListenBrainz for the configured user."""
+        recording_mbids = self.get_recommended_recording_mbids()
+        if not recording_mbids:
+            logger.info("No recommendations found from ListenBrainz.")
+            return []
+
+        artists = set()
+        for mbid in recording_mbids:
+            for artist_name in self.get_recording_artist_names(mbid):
+                artists.add(artist_name)
 
         return list(artists)
 
