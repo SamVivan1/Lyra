@@ -1,9 +1,7 @@
-version: '3.8'
-
 services:
   music-automation:
     build: .
-    container_name: music-automation
+    container_name: lyra
     restart: unless-stopped
     env_file:
       - .env
@@ -14,4 +12,4 @@ services:
       - ./data:/app/data
     environment:
       - DB_PATH=/app/data/music_automation.db
-      - TZ=UTC # Change to your timezone if needed
+      - TZ=Asia/Jakarta # Change to your timezone if needed
