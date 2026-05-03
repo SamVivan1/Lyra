@@ -25,7 +25,7 @@ A robust, modular Python service for automating music acquisition using a hybrid
    ```bash
    cp .env.example .env
    ```
-   Edit `.env` and fill in your ListenBrainz username, Lidarr URL, and Lidarr API Key.
+   Edit `.env` and fill in your ListenBrainz username, ListenBrainz API token, Lidarr URL, and Lidarr API Key.
 
 3. Create data directory for SQLite state:
    ```bash

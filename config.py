@@ -7,6 +7,7 @@ load_dotenv()
 class Config:
     LISTENBRAINZ_USERNAME = os.getenv("LISTENBRAINZ_USERNAME")
     LISTENBRAINZ_API_URL = "https://api.listenbrainz.org/1"
+    LISTENBRAINZ_API_TOKEN = os.getenv("LISTENBRAINZ_API_TOKEN")
     
     LIDARR_URL = os.getenv("LIDARR_URL", "http://localhost:8686").rstrip("/")
     LIDARR_API_KEY = os.getenv("LIDARR_API_KEY")
@@ -29,6 +30,8 @@ class Config:
         missing = []
         if not cls.LISTENBRAINZ_USERNAME:
             missing.append("LISTENBRAINZ_USERNAME")
+        if not cls.LISTENBRAINZ_API_TOKEN:
+            missing.append("LISTENBRAINZ_API_TOKEN")
         if not cls.LIDARR_API_KEY:
             missing.append("LIDARR_API_KEY")
             

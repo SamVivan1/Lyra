@@ -5,13 +5,22 @@ from utils import setup_logger, rate_limit
 logger = setup_logger("listenbrainz")
 
 class ListenBrainzClient:
-    def __init__(self, username=Config.LISTENBRAINZ_USERNAME, base_url=Config.LISTENBRAINZ_API_URL):
+    def __init__(self, username=Config.LISTENBRAINZ_USERNAME, base_url=Config.LISTENBRAINZ_API_URL, token=Config.LISTENBRAINZ_API_TOKEN):
         self.username = username
         self.base_url = base_url
+        self.token = token
         self.headers = {
             "Accept": "application/json",
             "User-Agent": "MusicAutomation/1.0 ( homelab deployment )"
         }
+        if self.token:
+            self.headers["Authorization"] = f"Token {self.token}"
+
+    def _recommendation_urls(self):
+        return [
+            f"{self.base_url}/recommendation/user/{self.username}/recording",
+            f"{self.base_url}/recommendation/user/{self.username}"
+        ]
 
     def get_recommended_artists(self):
         """Fetch recommended artists from ListenBrainz for the configured user."""
@@ -19,29 +28,38 @@ class ListenBrainzClient:
             logger.error("ListenBrainz username is not configured.")
             return []
 
-        url = f"{self.base_url}/recommendation/user/{self.username}"
-        logger.info(f"Fetching recommendations from {url}")
-        
         artists = set()
-        try:
-            rate_limit()
-            response = requests.get(url, headers=self.headers, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            recordings = data.get("payload", {}).get("recordings", [])
-            
-            for rec in recordings:
-                artist_credits = rec.get("artist_credit", [])
-                for ac in artist_credits:
-                    artist_name = ac.get("artist_name")
-                    if artist_name:
-                        artists.add(artist_name)
-                        
-            return list(artists)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching recommendations from ListenBrainz: {e}")
+        recordings = []
+        for url in self._recommendation_urls():
+            logger.info(f"Fetching recommendations from {url}")
+            try:
+                rate_limit()
+                response = requests.get(url, headers=self.headers, timeout=10)
+                if response.status_code == 404:
+                    logger.warning(f"ListenBrainz endpoint not found: {url}")
+                    continue
+                response.raise_for_status()
+
+                data = response.json()
+                recordings = data.get("payload", {}).get("recordings", [])
+                if recordings:
+                    break
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error fetching recommendations from ListenBrainz: {e}")
+                return []
+
+        if not recordings:
+            logger.info("No recommendation recordings found from ListenBrainz.")
             return []
+
+        for rec in recordings:
+            artist_credits = rec.get("artist_credit", [])
+            for ac in artist_credits:
+                artist_name = ac.get("artist_name")
+                if artist_name:
+                    artists.add(artist_name)
+
+        return list(artists)
 
     def get_top_tracks_for_artist(self, artist_name, limit=2):
         """Fetch the user's listening history and find top tracks for a specific artist."""
