@@ -2,6 +2,7 @@ import subprocess
 import os
 import glob
 import json
+import re
 import mutagen
 from config import Config
 from utils import setup_logger
@@ -17,39 +18,15 @@ class Downloader:
         """Simple deduplication check: look for similar filenames in the library."""
         safe_artist = artist.replace('*', '').replace('?', '')
         safe_track = track.replace('*', '').replace('?', '')
-        
-        # Now checks the Artist folder specifically based on the new pattern
-        pattern = os.path.join(self.library_path, safe_artist, f"*{safe_track}*")
-        matches = glob.glob(pattern)
-        
+
+        pattern = os.path.join(self.library_path, safe_artist, "**", f"*{safe_track}*")
+        matches = glob.glob(pattern, recursive=True)
+
         # Also check the old pattern just in case
-        old_pattern = os.path.join(self.library_path, f"*{safe_artist}*{safe_track}*")
-        matches.extend(glob.glob(old_pattern))
-        
+        old_pattern = os.path.join(self.library_path, "**", f"*{safe_artist}*{safe_track}*")
+        matches.extend(glob.glob(old_pattern, recursive=True))
+
         return len(matches) > 0
-
-    def _apply_metadata(self, file_path, artist, title):
-        """Apply ID3 tags to the downloaded MP3 file."""
-        if not os.path.exists(file_path):
-            return
-            
-        try:
-            audio = EasyID3(file_path)
-        except Exception:
-            try:
-                # If no ID3 tag exists, create one
-                m_file = mutagen.File(file_path, easy=True)
-                m_file.add_tags()
-                audio = m_file
-            except Exception as e:
-                logger.error(f"Failed to initialize ID3 tags for {file_path}: {e}")
-                return
-
-        audio['title'] = title
-        audio['artist'] = artist
-        audio['albumartist'] = artist
-        audio.save()
-        logger.debug(f"Applied ID3 tags: Artist='{artist}', Title='{title}' to {file_path}")
 
     def download_track(self, artist, track):
         """Download track from YouTube using yt-dlp (Automated process)."""
@@ -75,7 +52,7 @@ class Downloader:
 
     def _find_or_create_artist_folder(self, artist):
         """Find an existing artist folder case-insensitively, or create a new one."""
-        artist_safe = artist.replace('/', '_').strip()
+        artist_safe = self._safe_name(artist)
         artist_lower = artist_safe.lower()
         
         # Check if the base library path exists
@@ -92,14 +69,62 @@ class Downloader:
         os.makedirs(new_folder, exist_ok=True)
         return new_folder
 
-    def download_manual(self, query_or_url, artist, title):
-        """Download from URL or Search Query, place in Artist/Title.mp3, and apply metadata."""
+    def _safe_name(self, name):
+        return re.sub(r'[<>:"/\\|?*\n\r]+', '_', (name or '').strip())
+
+    def _find_or_create_album_folder(self, artist, album):
+        album_safe = self._safe_name(album or 'Unknown Album')
         artist_folder = self._find_or_create_artist_folder(artist)
+        album_folder = os.path.join(artist_folder, album_safe)
+        os.makedirs(album_folder, exist_ok=True)
+        return album_folder
+
+    def _apply_metadata(self, file_path, artist, title, album=None, album_artist=None, year=None, release_date=None, track_number=None):
+        """Apply ID3 tags to the downloaded MP3 file."""
+        if not os.path.exists(file_path):
+            return
+            
+        try:
+            audio = EasyID3(file_path)
+        except Exception:
+            try:
+                m_file = mutagen.File(file_path, easy=True)
+                m_file.add_tags()
+                audio = m_file
+            except Exception as e:
+                logger.error(f"Failed to initialize ID3 tags for {file_path}: {e}")
+                return
+
+        audio['title'] = title
+        audio['artist'] = artist
+        audio['albumartist'] = album_artist or artist
+        if album:
+            audio['album'] = album
+        if release_date:
+            audio['date'] = release_date
+        elif year:
+            audio['date'] = str(year)
+        if track_number:
+            audio['tracknumber'] = str(track_number)
+        audio.save()
+        logger.debug(
+            f"Applied ID3 tags: Artist='{artist}', Title='{title}', Album='{album}', AlbumArtist='{album_artist or artist}', Date='{release_date or year}', TrackNumber='{track_number}' to {file_path}"
+        )
+
+    def download_manual(self, query_or_url, artist, title, album=None, album_artist=None, year=None, release_date=None, track_number=None):
+        """Download from URL or Search Query, place in Album folder, and apply metadata."""
+        if self._track_exists(artist, title):
+            logger.info(f"Track '{artist} - {title}' already exists in library. Skipping download.")
+            return True
+
+        if album:
+            output_folder = self._find_or_create_album_folder(artist, album)
+        else:
+            output_folder = self._find_or_create_artist_folder(artist)
         
-        # Save file directly as Title.mp3 inside Artist folder
-        safe_title = title.replace('/', '_').strip()
-        output_template = os.path.join(artist_folder, f"{safe_title}.%(ext)s")
-        expected_output_path = os.path.join(artist_folder, f"{safe_title}.mp3")
+        safe_title = self._safe_name(title)
+        output_template = os.path.join(output_folder, f"{safe_title}.%(ext)s")
+        expected_output_path = os.path.join(output_folder, f"{safe_title}.mp3")
 
         command = self._get_yt_dlp_base_cmd() + [
             "--extract-audio",
@@ -117,8 +142,16 @@ class Downloader:
             result = subprocess.run(command, capture_output=True, text=True, check=True)
             logger.debug(f"yt-dlp output: {result.stdout}")
             
-            # Additional ID3 Tagging using Mutagen
-            self._apply_metadata(expected_output_path, artist, title)
+            self._apply_metadata(
+                expected_output_path,
+                artist,
+                title,
+                album=album,
+                album_artist=album_artist,
+                year=year,
+                release_date=release_date,
+                track_number=track_number
+            )
             
             logger.info(f"Successfully downloaded '{artist} - {title}' to {expected_output_path}")
             return True

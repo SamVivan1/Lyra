@@ -41,7 +41,7 @@ A robust, modular Python service for automating music acquisition using a hybrid
 ## Usage (CLI)
 
 ### Interactive Manual Downloader
-Terdapat fitur CLI interaktif (`cli.py`) untuk mencari dan mendownload lagu secara manual yang tidak masuk ke otomasi. Fitur ini sudah dilengkapi dengan manajemen metadata otomatis.
+Terdapat fitur CLI interaktif (`cli.py`) untuk mencari dan mendownload lagu secara manual yang tidak masuk ke otomasi. Fitur ini sudah dilengkapi dengan manajemen metadata otomatis dan sekarang akan mencoba mendeteksi album dari MusicBrainz agar lagu tersimpan dalam folder album yang benar.
 
 Cara termudah untuk menjalankannya jika menggunakan Docker adalah dengan mengeksekusi shell ke dalam container `lyra`:
 ```bash
