@@ -60,6 +60,19 @@ class Downloader:
         query = f"ytsearch1:{artist} {track} official audio"
         return self.download_manual(query, artist, track)
 
+    def _get_yt_dlp_base_cmd(self):
+        """Helper to get base yt-dlp command with cookies if available."""
+        cmd = ["yt-dlp"]
+        cookies_path = "/app/data/cookies.txt"
+        if os.path.exists(cookies_path):
+            cmd.extend(["--cookies", cookies_path])
+        # Also try local path if running outside docker
+        elif os.path.exists("data/cookies.txt"):
+            cmd.extend(["--cookies", "data/cookies.txt"])
+        elif os.path.exists("cookies.txt"):
+            cmd.extend(["--cookies", "cookies.txt"])
+        return cmd
+
     def download_manual(self, query_or_url, artist, title):
         """Download from URL or Search Query, place in Artist/Title.mp3, and apply metadata."""
         artist_folder = os.path.join(self.library_path, artist.replace('/', '_'))
@@ -70,8 +83,7 @@ class Downloader:
         output_template = os.path.join(artist_folder, f"{safe_title}.%(ext)s")
         expected_output_path = os.path.join(artist_folder, f"{safe_title}.mp3")
 
-        command = [
-            "yt-dlp",
+        command = self._get_yt_dlp_base_cmd() + [
             "--extract-audio",
             "--audio-format", "mp3",
             "--audio-quality", "0",
@@ -102,8 +114,7 @@ class Downloader:
 
     def get_search_results(self, query, limit=5):
         """Search YouTube and return a list of result dictionaries."""
-        command = [
-            "yt-dlp",
+        command = self._get_yt_dlp_base_cmd() + [
             "--dump-json",
             f"ytsearch{limit}:{query}"
         ]
