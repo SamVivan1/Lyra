@@ -1,5 +1,5 @@
 requests>=2.31.0
-yt-dlp>=2024.03.10
+yt-dlp>=2024.04.09
 python-dotenv>=1.0.1
 rich>=13.0.0
 questionary>=2.0.0

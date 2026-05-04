@@ -116,6 +116,7 @@ class Downloader:
         """Search YouTube and return a list of result dictionaries."""
         command = self._get_yt_dlp_base_cmd() + [
             "--dump-json",
+            "--flat-playlist",
             f"ytsearch{limit}:{query}"
         ]
         
