@@ -39,6 +39,17 @@ A robust, modular Python service for automating music acquisition using a hybrid
    The container will run in a continuous loop every 6 hours by default.
 
 ## Usage (CLI)
+
+### Interactive Manual Downloader
+Terdapat fitur CLI interaktif (`cli.py`) untuk mencari dan mendownload lagu secara manual yang tidak masuk ke otomasi. Fitur ini sudah dilengkapi dengan manajemen metadata otomatis.
+
+Cara termudah untuk menjalankannya jika menggunakan Docker adalah dengan mengeksekusi shell ke dalam container `lyra`:
+```bash
+docker exec -it lyra python cli.py
+```
+*(Tip: Anda bisa membuat alias di `~/.zshrc` atau `~/.bashrc` untuk mempermudah, contoh: `alias musicdl="docker exec -it lyra python cli.py"`)*
+
+### Automated Scripts
 You can run the script manually or via cron.
 First, install dependencies:
 ```bash
