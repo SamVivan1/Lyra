@@ -73,13 +73,31 @@ class Downloader:
             cmd.extend(["--cookies", "cookies.txt"])
         return cmd
 
+    def _find_or_create_artist_folder(self, artist):
+        """Find an existing artist folder case-insensitively, or create a new one."""
+        artist_safe = artist.replace('/', '_').strip()
+        artist_lower = artist_safe.lower()
+        
+        # Check if the base library path exists
+        if not os.path.exists(self.library_path):
+            os.makedirs(self.library_path, exist_ok=True)
+            
+        # Scan existing directories
+        for entry in os.scandir(self.library_path):
+            if entry.is_dir() and entry.name.lower() == artist_lower:
+                return os.path.join(self.library_path, entry.name)
+                
+        # If not found, create a new one using the requested casing
+        new_folder = os.path.join(self.library_path, artist_safe)
+        os.makedirs(new_folder, exist_ok=True)
+        return new_folder
+
     def download_manual(self, query_or_url, artist, title):
         """Download from URL or Search Query, place in Artist/Title.mp3, and apply metadata."""
-        artist_folder = os.path.join(self.library_path, artist.replace('/', '_'))
-        os.makedirs(artist_folder, exist_ok=True)
+        artist_folder = self._find_or_create_artist_folder(artist)
         
         # Save file directly as Title.mp3 inside Artist folder
-        safe_title = title.replace('/', '_')
+        safe_title = title.replace('/', '_').strip()
         output_template = os.path.join(artist_folder, f"{safe_title}.%(ext)s")
         expected_output_path = os.path.join(artist_folder, f"{safe_title}.mp3")
 
@@ -121,25 +139,34 @@ class Downloader:
         ]
         
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            # check=False because yt-dlp might exit with 1 if some search results have issues,
+            # but it still outputs valid JSON for the others.
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
             results = []
-            for line in result.stdout.strip().split('\\n'):
+            for line in result.stdout.strip().split('\n'):
                 if not line:
                     continue
                 try:
                     data = json.loads(line)
+                    
+                    # Flat playlist might not have 'webpage_url', but 'url' instead
+                    url = data.get('webpage_url') or data.get('url', '')
+                    if not url.startswith('http'):
+                        url = f"https://www.youtube.com/watch?v={url}" if url else ''
+                        
                     results.append({
                         'title': data.get('title', 'Unknown Title'),
-                        'uploader': data.get('uploader', 'Unknown Uploader'),
-                        'duration': data.get('duration_string', 'N/A'),
-                        'url': data.get('webpage_url', '')
+                        'uploader': data.get('uploader') or data.get('channel', 'Unknown Uploader'),
+                        'duration': data.get('duration_string') or str(data.get('duration', 'N/A')),
+                        'url': url
                     })
                 except json.JSONDecodeError:
                     continue
+                    
+            if not results and result.stderr:
+                logger.error(f"Search error output: {result.stderr}")
+                
             return results
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Search failed: {e.stderr}")
-            return []
-        except FileNotFoundError:
-            logger.error("yt-dlp not found! Please ensure it is installed and in your PATH.")
+        except Exception as e:
+            logger.error(f"Search execution failed: {e}")
             return []
