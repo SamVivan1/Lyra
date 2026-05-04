@@ -14,8 +14,47 @@ console = Console()
 downloader = Downloader()
 musicbrainz_client = MusicBrainzClient()
 
+def _clean_label_text(text):
+    if not text:
+        return text
+    cleaned = text.strip()
+    # Remove trailing parenthetical qualifiers
+    while '(' in cleaned and ')' in cleaned:
+        start = cleaned.index('(')
+        end = cleaned.index(')', start)
+        cleaned = (cleaned[:start] + cleaned[end + 1:]).strip()
+    cleaned = cleaned.replace('official lyric video', '')
+    cleaned = cleaned.replace('official video', '')
+    cleaned = cleaned.replace('official audio', '')
+    cleaned = cleaned.replace('lyrics', '')
+    cleaned = cleaned.replace('lyric video', '')
+    return ' '.join(cleaned.split()).strip()
+
+
+def _parse_artist_title_from_label(label, uploader=None):
+    label = label.strip()
+    for delim in [" - ", " – ", " — "]:
+        if delim in label:
+            parts = [part.strip() for part in label.split(delim, 1)]
+            if len(parts) == 2:
+                left = _clean_label_text(parts[0])
+                right = _clean_label_text(parts[1])
+                if uploader and uploader.lower() != left.lower():
+                    return left, right
+                return left, right
+    return None, None
+
+
 def _prompt_album_metadata(artist, title):
     candidate = musicbrainz_client.get_best_release_metadata(artist, title)
+    if not candidate:
+        parsed_artist, parsed_title = _parse_artist_title_from_label(title)
+        if parsed_artist and parsed_title and (parsed_artist.lower() != artist.lower() or parsed_title.lower() != title.lower()):
+            candidate = musicbrainz_client.get_best_release_metadata(parsed_artist, parsed_title)
+            if candidate:
+                artist = parsed_artist
+                title = parsed_title
+
     if candidate and candidate.get("album"):
         album = candidate["album"]
         album_artist = candidate.get("album_artist") or artist
@@ -109,8 +148,12 @@ def search_menu():
     
     console.print(f"\n[cyan]Lagu terpilih:[/cyan] {selected_item['title']}")
     
-    artist = questionary.text("Nama Artis (Untuk folder & metadata):", default=selected_item['uploader']).ask()
-    title = questionary.text("Judul Lagu (Untuk nama file & metadata):", default=selected_item['title']).ask()
+    parsed_artist, parsed_title = _parse_artist_title_from_label(selected_item['title'], selected_item['uploader'])
+    disambiguated_artist = parsed_artist or selected_item['uploader']
+    disambiguated_title = parsed_title or selected_item['title']
+
+    artist = questionary.text("Nama Artis (Untuk folder & metadata):", default=disambiguated_artist).ask()
+    title = questionary.text("Judul Lagu (Untuk nama file & metadata):", default=disambiguated_title).ask()
 
     if not artist or not title:
         console.print("[yellow]Download dibatalkan.[/yellow]")

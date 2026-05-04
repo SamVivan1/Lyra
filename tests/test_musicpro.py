@@ -9,6 +9,7 @@ sys.path.insert(0, ROOT_DIR)
 
 from musicbrainz import MusicBrainzClient
 from downloader import Downloader
+from cli import _parse_artist_title_from_label
 
 
 class TestMusicBrainzClient(unittest.TestCase):
@@ -118,6 +119,20 @@ class TestDownloader(unittest.TestCase):
         self.assertTrue(os.path.isdir(album_folder))
         self.assertIn(self.downloader._safe_name(album), album_folder)
         self.assertIn(self.downloader._safe_name(artist), album_folder)
+
+
+class TestCliParsing(unittest.TestCase):
+    def test_parse_artist_title_from_youtube_label(self):
+        label = 'Multo - Cup of Joe (Official Lyric Video)'
+        artist, title = _parse_artist_title_from_label(label, uploader='Cup of Joe')
+        self.assertEqual(artist, 'Multo')
+        self.assertEqual(title, 'Cup of Joe')
+
+    def test_parse_label_without_artist(self):
+        label = 'Cup of Joe'
+        artist, title = _parse_artist_title_from_label(label, uploader='Cup of Joe')
+        self.assertIsNone(artist)
+        self.assertIsNone(title)
 
 
 if __name__ == '__main__':

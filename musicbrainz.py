@@ -19,23 +19,66 @@ class MusicBrainzClient:
             return ""
         return text.replace('"', '').strip()
 
-    def search_recording(self, artist, title, limit=5):
-        query = f'recording:"{self._escape_query(title)}" AND artist:"{self._escape_query(artist)}"'
-        params = {
-            "fmt": "json",
-            "query": query,
-            "limit": limit,
-            "inc": "artist-credits+releases"
-        }
+    def _strip_parenthetical(self, text):
+        if not text:
+            return text
+        result = text
+        while '(' in result and ')' in result:
+            start = result.index('(')
+            end = result.index(')', start)
+            result = (result[:start] + result[end + 1:]).strip()
+        return result
 
-        try:
-            rate_limit()
-            response = requests.get(self._search_recording_url(), headers=self.headers, params=params, timeout=10)
-            response.raise_for_status()
-            return response.json().get("recordings", [])
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"MusicBrainz recording search failed: {e}")
+    def _normalize_search_terms(self, text):
+        if not text:
             return []
+        cleaned = text.strip()
+        stripped = self._strip_parenthetical(cleaned).strip()
+        results = [cleaned]
+        if stripped and stripped != cleaned:
+            results.append(stripped)
+        return list(dict.fromkeys(results))
+
+    def search_recording(self, artist, title, limit=5):
+        title_variants = self._normalize_search_terms(title)
+        artist_variants = self._normalize_search_terms(artist)
+        queries = []
+
+        for title_variant in title_variants:
+            for artist_variant in artist_variants:
+                if title_variant and artist_variant:
+                    queries.append(f'recording:"{self._escape_query(title_variant)}" AND artist:"{self._escape_query(artist_variant)}"')
+        for title_variant in title_variants:
+            if title_variant:
+                queries.append(f'recording:"{self._escape_query(title_variant)}"')
+                queries.append(f'"{self._escape_query(title_variant)}"')
+        for artist_variant in artist_variants:
+            if artist_variant:
+                queries.append(f'artist:"{self._escape_query(artist_variant)}"')
+                queries.append(f'"{self._escape_query(artist_variant)}"')
+        if title_variants and artist_variants:
+            queries.append(f'"{self._escape_query(title_variants[0])}" {self._escape_query(artist_variants[0])}')
+            queries.append(f'"{self._escape_query(artist_variants[0])}" {self._escape_query(title_variants[0])}')
+
+        for query in queries:
+            params = {
+                "fmt": "json",
+                "query": query,
+                "limit": limit,
+                "inc": "artist-credits+releases"
+            }
+            try:
+                rate_limit()
+                response = requests.get(self._search_recording_url(), headers=self.headers, params=params, timeout=10)
+                response.raise_for_status()
+                recordings = response.json().get("recordings", [])
+                if recordings:
+                    return recordings
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"MusicBrainz recording search failed for query '{query}': {e}")
+                continue
+
+        return []
 
     def get_best_release_metadata(self, artist, title):
         recordings = self.search_recording(artist, title, limit=5)
