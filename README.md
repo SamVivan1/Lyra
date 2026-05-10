@@ -1,87 +1,114 @@
-# Self-Hosted Music Automation System
+# Lyra: Self-Hosted Music Automation System 🎵
 
-A robust, modular Python service for automating music acquisition using a hybrid pipeline in a homelab environment.
+Lyra is a production-ready, modular Python service designed for homelab environments. It automates music acquisition using a hybrid pipeline that prioritizes high-quality torrents via **Lidarr** and falls back to **YouTube** for hard-to-find content.
 
-## Overview
-1. Fetches recommended artists from ListenBrainz.
-2. Automatically adds them to Lidarr for torrent-based acquisition.
-3. Monitors Lidarr for missing content.
-4. Falls back to YouTube (via `yt-dlp`) after 24 hours if content is still missing.
-5. Deduplicates and integrates seamlessly with Navidrome via a shared directory.
+## 🚀 Key Features
 
-## Prerequisites
-- Lidarr running locally or via network.
-- Docker & Docker Compose (optional but recommended).
-- A ListenBrainz account with listening history and recommendations.
+*   **ListenBrainz Integration**: Fetches personalized artist recommendations based on your listening history.
+*   **Hybrid Acquisition**: 
+    *   **Primary**: Automatically adds artists to Lidarr for high-quality automated downloads.
+    *   **Fallback**: If Lidarr fails to acquire content after a configurable delay (default 24h), Lyra automatically downloads top tracks from YouTube.
+*   **Intelligent Path Mapping**: Supports decoupled path configurations for Docker-to-Host compatibility.
+*   **Manual CLI Downloader**: Interactive search and download tool with automatic metadata tagging (via MusicBrainz) and folder organization.
+*   **Deduplication**: Prevents duplicate downloads by scanning your existing library.
+*   **Metadata Enrichment**: Automatically applies ID3 tags (Artist, Title, Album, Year, Cover Art) to fallback downloads.
+*   **State Persistence**: Uses SQLite to track artist addition timestamps and fallback status.
 
-## Installation (Docker)
-1. Clone the repository:
-   ```bash
-   git clone <repo-url>
-   cd music-automation
-   ```
+---
 
-2. Copy the environment template:
-   ```bash
-   cp .env.example .env
-   ```
-   Edit `.env` and fill in your ListenBrainz username, ListenBrainz API token, Lidarr URL, and Lidarr API Key.
+## 🛠️ Architecture
 
-3. Create data directory for SQLite state:
-   ```bash
-   mkdir data
-   ```
+1.  **ListenBrainz API**: Source of personalized recommendations.
+2.  **Lidarr**: Primary acquisition engine (Torrents/Usenet).
+3.  **yt-dlp**: Fallback acquisition engine (YouTube Audio).
+4.  **MusicBrainz**: Metadata provider for tagging fallback tracks.
+5.  **Navidrome/Jellyfin**: Final destination (structured library).
 
-4. Build and start the container:
-   ```bash
-   docker-compose up -d --build
-   ```
-   The container will run in a continuous loop every 6 hours by default.
+---
 
-## Usage (CLI)
+## 📋 Prerequisites
 
-### Interactive Manual Downloader
-Terdapat fitur CLI interaktif (`cli.py`) untuk mencari dan mendownload lagu secara manual yang tidak masuk ke otomasi. Fitur ini sudah dilengkapi dengan manajemen metadata otomatis dan sekarang akan mencoba mendeteksi album dari MusicBrainz agar lagu tersimpan dalam folder album yang benar.
+*   **Lidarr**: Installed and reachable via network/Docker.
+*   **yt-dlp**: Installed on the host or inside the container.
+*   **ListenBrainz Account**: To get personalized recommendations.
+*   **Python 3.10+**: If running outside Docker.
 
-Cara termudah untuk menjalankannya jika menggunakan Docker adalah dengan mengeksekusi shell ke dalam container `lyra`:
+---
+
+## ⚙️ Configuration (.env)
+
+Lyra uses a decoupled path system to ensure compatibility between your local filesystem and Lidarr's internal environment.
+
+| Variable | Description | Example |
+| :--- | :--- | :--- |
+| `LIDARR_URL` | Your Lidarr instance URL | `http://192.168.1.10:8686` |
+| `LIDARR_API_KEY` | Your Lidarr API Key | `your_api_key_here` |
+| `LIDARR_ROOT_FOLDER_PATH` | The path **Lidarr** uses internally | `/music` |
+| `LIBRARY_PATH` | The path **Lyra (this script)** uses locally | `/mnt/Storage2/data/media/Music` |
+| `LISTENBRAINZ_USERNAME` | Your ListenBrainz username | `samvivan` |
+| `LISTENBRAINZ_API_TOKEN` | Your ListenBrainz API token | `your_token_here` |
+| `MAX_ARTISTS_PER_RUN` | Max artists to add in one run | `5` |
+| `FALLBACK_HOURS` | Hours to wait before YouTube fallback | `24` |
+
+---
+
+## 🐳 Docker Setup (Recommended)
+
+1.  **Clone & Configure**:
+    ```bash
+    git clone https://github.com/your-username/lyra.git
+    cd lyra
+    cp .env.example .env
+    # Edit .env with your credentials
+    ```
+
+2.  **Launch**:
+    ```bash
+    docker-compose up -d --build
+    ```
+
+---
+
+## 💻 Usage
+
+### Automated Pipeline
+Run the main automation logic (typically via Cron or the built-in loop mode):
 ```bash
+python main.py [flags]
+```
+*   `--dry-run`: See what would happen without making changes.
+*   `--limit X`: Override the max artists added.
+*   `--add-only`: Only add new artists from ListenBrainz.
+*   `--fallback-only`: Only check and run YouTube fallbacks.
+
+### Manual Interactive Downloader
+For specific tracks or albums not covered by automation:
+```bash
+# Host
+python cli.py
+
+# Docker
 docker exec -it lyra python cli.py
 ```
-*(Tip: Anda bisa membuat alias di `~/.zshrc` atau `~/.bashrc` untuk mempermudah, contoh: `alias musicdl="docker exec -it lyra python cli.py"`)*
+*Tip: Create an alias for quick access:* `alias musicdl="docker exec -it lyra python cli.py"`
 
-### Automated Scripts
-You can run the script manually or via cron.
-First, install dependencies:
-```bash
-pip install -r requirements.txt
-```
+---
 
-Run one-shot operations:
-```bash
-python main.py
-python main.py --dry-run
-python main.py --limit 10
-python main.py --add-only
-python main.py --fallback-only
-```
+## 📁 Path Mapping Explanation
 
-### Example Cron Setup
-If you prefer cron instead of the continuous `--loop` mode:
-```cron
-# Run standard pipeline (add artists + check fallbacks) every 6 hours
-0 */6 * * * cd /path/to/music-automation && /usr/bin/python3 main.py
+If you run Lidarr in Docker, it might map its internal `/music` folder to your host's `/mnt/Storage2/data/media/Music`. 
 
-# Alternatively, split the tasks:
-# Add artists at 00:00, 12:00
-0 0,12 * * * cd /path/to/music-automation && /usr/bin/python3 main.py --add-only
-# Check fallback at 06:00, 18:00
-0 6,18 * * * cd /path/to/music-automation && /usr/bin/python3 main.py --fallback-only
-```
+*   Set `LIDARR_ROOT_FOLDER_PATH=/music` (Lidarr needs this to know where to move files).
+*   Set `LIBRARY_PATH=/mnt/Storage2/data/media/Music` (Lyra needs this to download YouTube tracks directly to your drive).
 
-## Volumes & Paths
-- By default, Lidarr downloads to `/DATA/Downloads`.
-- The final structured library is in `/mnt/Storage2/data/media/Music`.
-Ensure these directories exist and are properly mounted in `docker-compose.yml`.
+---
 
-## Logs
-Logs are output to the console and saved to `music_automation.log` (or within the Docker container logs).
+## 📝 Logs
+Lyra maintains detailed logs for troubleshooting:
+*   Standard output (Docker logs)
+*   `music_automation.log` file
+
+---
+
+## 📜 License
+MIT License. Feel free to use and modify for your homelab!
