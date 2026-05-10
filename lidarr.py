@@ -27,10 +27,13 @@ class LidarrClient:
         try:
             rate_limit()
             response = requests.post(f"{self.url}{endpoint}", headers=self.headers, json=json_data, timeout=10)
+            if response.status_code == 400:
+                logger.error(f"Lidarr POST {endpoint} failed (400): {response.text}")
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            logger.error(f"Lidarr POST {endpoint} failed: {e}")
+            if not (isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 400):
+                logger.error(f"Lidarr POST {endpoint} failed: {e}")
             return None
 
     def get_existing_artists(self):
@@ -56,21 +59,19 @@ class LidarrClient:
         # Take the first exact or best match
         best_match = search_results[0]
         
-        payload = {
-            "artistName": best_match.get("artistName"),
+        # Build the payload using the lookup result as a base
+        # This ensures we get all required fields like artistType, images, etc.
+        payload = best_match.copy()
+        payload.update({
             "qualityProfileId": Config.QUALITY_PROFILE_ID,
             "metadataProfileId": Config.METADATA_PROFILE_ID,
-            "rootFolderPath": Config.ROOT_FOLDER_PATH,
+            "rootFolderPath": Config.LIDARR_ROOT_FOLDER_PATH,
             "monitored": True,
             "addOptions": {
-                "searchForMissingAlbums": True
-            },
-            # Lidarr requires some existing fields from the lookup
-            "foreignArtistId": best_match.get("foreignArtistId"),
-            "images": best_match.get("images", []),
-            "links": best_match.get("links", []),
-            "genres": best_match.get("genres", [])
-        }
+                "searchForMissingAlbums": True,
+                "monitor": "all"
+            }
+        })
         
         logger.info(f"Adding artist '{best_match.get('artistName')}' to Lidarr")
         result = self._post("/api/v1/artist", json_data=payload)

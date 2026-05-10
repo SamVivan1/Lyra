@@ -13,12 +13,14 @@ class Config:
     LIDARR_API_KEY = os.getenv("LIDARR_API_KEY")
     QUALITY_PROFILE_ID = int(os.getenv("QUALITY_PROFILE_ID", 1))
     METADATA_PROFILE_ID = int(os.getenv("METADATA_PROFILE_ID", 1))
-    ROOT_FOLDER_PATH = "/mnt/Storage2/data/media/Music" # As per goal.md
+    
+    # Root path as seen BY Lidarr (API)
+    LIDARR_ROOT_FOLDER_PATH = os.getenv("LIDARR_ROOT_FOLDER_PATH", "/music")
     
     MAX_ARTISTS_PER_RUN = int(os.getenv("MAX_ARTISTS_PER_RUN", 5))
     FALLBACK_HOURS = int(os.getenv("FALLBACK_HOURS", 24))
     
-    # Paths
+    # Paths as seen BY this script (Local Filesystem)
     LIBRARY_PATH = os.getenv("LIBRARY_PATH", "/mnt/Storage2/data/media/Music")
     DOWNLOAD_PATH = os.getenv("DOWNLOAD_PATH", "/DATA/Downloads")
     DB_PATH = os.getenv("DB_PATH", "music_automation.db")
