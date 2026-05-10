@@ -22,8 +22,8 @@ def add_artists(limit, dry_run):
     lidarr_client = LidarrClient()
     state_manager = StateManager()
 
-    recommended_artists = lb_client.get_recommended_artists()
-    if not recommended_artists:
+    recommendations = lb_client.get_recommended_artists_with_tracks()
+    if not recommendations:
         logger.info("No recommendations found.")
         return
 
@@ -33,7 +33,7 @@ def add_artists(limit, dry_run):
     tracked_artists_lower = [a.lower() for a in tracked_artists]
 
     added_count = 0
-    for artist in recommended_artists:
+    for artist, tracks in recommendations.items():
         if added_count >= limit:
             logger.info(f"Reached limit of {limit} artists per run.")
             break
@@ -52,23 +52,19 @@ def add_artists(limit, dry_run):
 
         logger.info(f"Adding new artist: {artist}")
         if dry_run:
-            logger.info(f"[DRY RUN] Would add '{artist}' to Lidarr and state.")
+            logger.info(f"[DRY RUN] Would add '{artist}' to Lidarr and state with {len(tracks)} tracks.")
             added_count += 1
         else:
             success = lidarr_client.add_artist(artist)
             if success:
-                state_manager.add_artist(artist)
+                state_manager.add_artist(artist, recommended_tracks=tracks)
                 added_count += 1
 
     logger.info(f"Finished adding {added_count} artists.")
 
 def run_fallback(dry_run):
-    if dry_run:
-        logger.info("[DRY RUN] Would run fallback logic.")
-        return
-        
     orchestrator = FallbackOrchestrator()
-    orchestrator.run_fallback()
+    orchestrator.run_fallback(dry_run=dry_run)
 
 def main():
     parser = argparse.ArgumentParser(description="Self-Hosted Music Automation System")

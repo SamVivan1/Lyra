@@ -47,8 +47,8 @@ class ListenBrainzClient:
             logger.error(f"Error fetching recording recommendations from ListenBrainz: {e}")
             return []
 
-    def get_recording_artist_names(self, recording_mbid):
-        """Resolve a ListenBrainz recording MBID to artist names via MusicBrainz."""
+    def get_recording_metadata(self, recording_mbid):
+        """Resolve a ListenBrainz recording MBID to artist names and track title via MusicBrainz."""
         url = self._musicbrainz_recording_url(recording_mbid)
         headers = {
             "Accept": "application/json",
@@ -62,6 +62,7 @@ class ListenBrainzClient:
             response.raise_for_status()
 
             data = response.json()
+            title = data.get("title")
             artist_names = []
             for ac in data.get("artist-credit", []):
                 if isinstance(ac, dict):
@@ -71,24 +72,34 @@ class ListenBrainzClient:
                         artist_names.append(name)
                 elif isinstance(ac, str):
                     artist_names.append(ac)
-            return artist_names
+            return artist_names, title
         except requests.exceptions.RequestException as e:
             logger.warning(f"Failed to resolve recording {recording_mbid} metadata: {e}")
-            return []
+            return [], None
 
-    def get_recommended_artists(self):
-        """Fetch recommended artists from ListenBrainz for the configured user."""
+    def get_recommended_artists_with_tracks(self):
+        """Fetch recommended artists and their tracks from ListenBrainz."""
         recording_mbids = self.get_recommended_recording_mbids()
         if not recording_mbids:
             logger.info("No recommendations found from ListenBrainz.")
-            return []
+            return {}
 
-        artists = set()
+        recommendations = {} # artist_name -> set(track_names)
         for mbid in recording_mbids:
-            for artist_name in self.get_recording_artist_names(mbid):
-                artists.add(artist_name)
+            artist_names, track_title = self.get_recording_metadata(mbid)
+            if not track_title:
+                continue
+            for artist_name in artist_names:
+                if artist_name not in recommendations:
+                    recommendations[artist_name] = set()
+                recommendations[artist_name].add(track_title)
 
-        return list(artists)
+        # Convert sets to lists
+        return {k: list(v) for k, v in recommendations.items()}
+
+    def get_recommended_artists(self):
+        """Fetch recommended artists from ListenBrainz for the configured user."""
+        return list(self.get_recommended_artists_with_tracks().keys())
 
     def get_top_tracks_for_artist(self, artist_name, limit=2):
         """Fetch the user's listening history and find top tracks for a specific artist."""

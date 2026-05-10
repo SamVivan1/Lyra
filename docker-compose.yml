@@ -4,6 +4,9 @@ services:
     container_name: lyra
     restart: unless-stopped
     network_mode: host
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     env_file:
       - .env
     volumes:

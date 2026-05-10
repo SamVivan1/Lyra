@@ -28,10 +28,14 @@ class Downloader:
 
         return len(matches) > 0
 
-    def download_track(self, artist, track):
+    def download_track(self, artist, track, dry_run=False):
         """Download track from YouTube using yt-dlp (Automated process)."""
         if self._track_exists(artist, track):
             logger.info(f"Track '{artist} - {track}' already exists in library. Skipping download.")
+            return True
+
+        if dry_run:
+            logger.info(f"[DRY RUN] Would download track: '{artist} - {track}'")
             return True
 
         query = f"ytsearch1:{artist} {track} official audio"
@@ -111,10 +115,14 @@ class Downloader:
             f"Applied ID3 tags: Artist='{artist}', Title='{title}', Album='{album}', AlbumArtist='{album_artist or artist}', Date='{release_date or year}', TrackNumber='{track_number}' to {file_path}"
         )
 
-    def download_manual(self, query_or_url, artist, title, album=None, album_artist=None, year=None, release_date=None, track_number=None):
+    def download_manual(self, query_or_url, artist, title, album=None, album_artist=None, year=None, release_date=None, track_number=None, dry_run=False):
         """Download from URL or Search Query, place in Album folder, and apply metadata."""
         if self._track_exists(artist, title):
             logger.info(f"Track '{artist} - {title}' already exists in library. Skipping download.")
+            return True
+
+        if dry_run:
+            logger.info(f"[DRY RUN] Would download: '{artist} - {title}'")
             return True
 
         if album:
