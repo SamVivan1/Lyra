@@ -7,7 +7,9 @@ Provides interactive menu for manual track downloads and metadata entry.
 import logging
 import sys
 import os
-from typing import Optional, Tuple
+import termios
+import tty
+from typing import Optional, Tuple, Dict, Any, List
 
 try:
     from rich.console import Console
@@ -107,45 +109,150 @@ class InteractiveDownloader:
         
         return ' '.join(cleaned.split()).strip()
 
+    def _get_single_character(self) -> str:
+        """Read a single character from stdin without requiring Enter."""
+        if os.name == "nt":
+            import msvcrt
+            return msvcrt.getwch()
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                seq = sys.stdin.read(2)
+                if seq == "[A":
+                    return "k"
+                if seq == "[B":
+                    return "j"
+                if seq == "[C":
+                    return "l"
+                if seq == "[D":
+                    return "h"
+            return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def _select_with_hjkl(self, items: List[str], title: str) -> Optional[int]:
+        """Select an item from a list using hjkl navigation."""
+        if not items:
+            return None
+
+        selected = 0
+        while True:
+            self._clear_screen()
+            self._print(f"\n{title}\n")
+            for index, item in enumerate(items):
+                prefix = ">" if index == selected else " "
+                self._print(f" {prefix} {item}")
+
+            self._print("\nUse [bold]hjkl[/bold] or arrow keys to navigate, Enter to select, q to cancel." if HAS_RICH else "\nUse hjkl or arrow keys to navigate, Enter to select, q to cancel.")
+
+            char = self._get_single_character()
+            if char in {"j", "J", "l", "L"}:
+                selected = (selected + 1) % len(items)
+            elif char in {"k", "K", "h", "H"}:
+                selected = (selected - 1) % len(items)
+            elif char in {"\r", "\n"}:
+                return selected
+            elif char in {"q", "Q", "\x03", "\x1b"}:
+                return None
+
+    def _prompt_field(self, label: str, current_value: Optional[str] = None) -> Optional[str]:
+        prompt = f"{label} [{current_value if current_value else 'none'}]: "
+        value = input(prompt).strip()
+        if value.lower() == "exit":
+            sys.exit(0)
+        return value if value else current_value
+
+    def _lookup_metadata(self, artist: str, title: str) -> Dict[str, Any]:
+        metadata = {
+            "artist": artist,
+            "title": title,
+            "album": None,
+            "track_number": None,
+            "album_artist": None,
+            "year": None,
+            "release_date": None
+        }
+
+        try:
+            mb_data = self.musicbrainz_client.get_best_release_metadata(artist, title)
+            if mb_data:
+                metadata["artist"] = mb_data.get("album_artist") or metadata["artist"]
+                metadata["title"] = mb_data.get("recording_title") or metadata["title"]
+                metadata["album"] = mb_data.get("album")
+                metadata["track_number"] = mb_data.get("track_position")
+                metadata["album_artist"] = mb_data.get("album_artist")
+                metadata["year"] = mb_data.get("year")
+                metadata["release_date"] = mb_data.get("release_date")
+        except Exception as e:
+            logger.debug(f"MusicBrainz metadata lookup failed: {e}")
+
+        return metadata
+
+    def _confirm_metadata(self, metadata: Dict[str, Any]) -> bool:
+        self._print("\nSuggested metadata:")
+        self._print(f"Artist: {metadata.get('artist')}")
+        self._print(f"Title: {metadata.get('title')}")
+        self._print(f"Album: {metadata.get('album') or 'Unknown'}")
+        self._print(f"Track #: {metadata.get('track_number') or 'Unknown'}")
+        self._print(f"Release date: {metadata.get('release_date') or 'Unknown'}")
+
+        response = input("\nIs this correct? [y/N]: ").strip().lower()
+        if response == "exit":
+            sys.exit(0)
+        return response == "y"
+
+    def _manual_metadata_entry(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        self._print("\nEnter corrected metadata or type 'exit' to cancel.")
+        metadata["artist"] = self._prompt_field("Artist", metadata.get("artist"))
+        metadata["title"] = self._prompt_field("Title", metadata.get("title"))
+        metadata["album"] = self._prompt_field("Album", metadata.get("album"))
+        track_number = self._prompt_field("Track number", str(metadata.get("track_number") or ""))
+        if track_number is not None:
+            try:
+                metadata["track_number"] = int(track_number)
+            except ValueError:
+                metadata["track_number"] = None
+        return metadata
+
+    def _download_with_metadata(self, url: str, metadata: Dict[str, Any]) -> None:
+        self._perform_download(
+            url,
+            metadata.get("artist") or "Unknown Artist",
+            metadata.get("title") or "Unknown Title",
+            album=metadata.get("album"),
+            album_artist=metadata.get("album_artist"),
+            year=metadata.get("year"),
+            release_date=metadata.get("release_date"),
+            track_number=metadata.get("track_number")
+        )
+
     def run(self) -> None:
         """Run the interactive downloader menu."""
         if not HAS_RICH:
             self._print("Warning: Install 'rich' for better CLI experience: pip install rich")
-        
-        while True:
-            self._clear_screen()
-            self._print("\n[bold cyan]🎵 Lyra Manual Downloader[/bold cyan]" if HAS_RICH else "\n=== Lyra Manual Downloader ===")
-            
-            try:
-                if HAS_RICH:
-                    choice = questionary.select(
-                        "Select action:",
-                        choices=[
-                            "🔍 Search YouTube",
-                            "🔗 Download from URL",
-                            "❌ Exit"
-                        ]
-                    ).ask()
-                else:
-                    self._print("\n1. Search YouTube")
-                    self._print("2. Download from URL")
-                    self._print("3. Exit")
-                    choice = input("\nSelect (1-3): ").strip()
-                
-                if choice == "🔍 Search YouTube" or choice == "1":
-                    self._search_and_download()
-                elif choice == "🔗 Download from URL" or choice == "2":
-                    self._download_from_url()
-                elif choice == "❌ Exit" or choice == "3" or choice is None:
+
+        try:
+            while True:
+                actions = [
+                    "Search YouTube",
+                    "Download from URL",
+                    "Exit"
+                ]
+                selected = self._select_with_hjkl(actions, title="Lyra Manual Downloader")
+                if selected is None or selected == 2:
                     self._print("[yellow]Goodbye![/yellow]" if HAS_RICH else "Goodbye!")
-                    break
-            except KeyboardInterrupt:
-                self._print("\n[yellow]Cancelled[/yellow]" if HAS_RICH else "\nCancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in interactive mode: {e}")
-                self._print(f"[red]Error: {e}[/red]" if HAS_RICH else f"Error: {e}")
-                input("Press Enter to continue...")
+                    sys.exit(0)
+                if selected == 0:
+                    self._search_and_download()
+                elif selected == 1:
+                    self._download_from_url()
+        except KeyboardInterrupt:
+            self._print("\n[yellow]Interrupted. Exiting.[/yellow]" if HAS_RICH else "\nInterrupted. Exiting.")
+            sys.exit(0)
 
     def _search_and_download(self) -> None:
         """Interactive YouTube search and download."""
@@ -161,59 +268,82 @@ class InteractiveDownloader:
             input("Press Enter to continue...")
             return
 
-        self._print("\n[cyan]Search Results:[/cyan]" if HAS_RICH else "\nSearch Results:")
-        for i, result in enumerate(results, 1):
-            self._print(
-                f"{i}. [{result['duration']}] {result['title']} "
-                f"(by {result['uploader']})"
-            )
-        
-        try:
-            choice = int(input("\nSelect (1-5) or 0 to cancel: ").strip())
-            if choice < 1 or choice > len(results):
-                return
-            
-            selected = results[choice - 1]
-            self._perform_download(selected['url'], selected['title'], selected['uploader'])
-        except (ValueError, IndexError):
-            self._print("[red]Invalid selection[/red]" if HAS_RICH else "Invalid selection")
-            input("Press Enter to continue...")
+        choices = [f"[{result['duration']}] {result['title']} (by {result['uploader']})" for result in results]
+        selected_index = self._select_with_hjkl(choices, title="Search Results")
+        if selected_index is None:
+            return
+
+        selected = results[selected_index]
+        artist, title = self._parse_artist_title_from_label(
+            selected["title"], selected.get("uploader")
+        )
+        if not artist or not title:
+            artist = selected.get("uploader") or "Unknown Artist"
+            title = selected.get("title") or "Unknown Title"
+
+        metadata = self._lookup_metadata(artist, title)
+        if not self._confirm_metadata(metadata):
+            metadata = self._manual_metadata_entry(metadata)
+
+        self._download_with_metadata(selected["url"], metadata)
 
     def _download_from_url(self) -> None:
         """Download from user-provided URL."""
         url = input("\nEnter URL (YouTube, Spotify, etc.): ").strip()
         if not url:
             return
-        
-        self._perform_download(url, "", "")
+
+        info = self.downloader.get_video_info(url)
+        artist, title = self._parse_artist_title_from_label(
+            info.get("title", ""), info.get("uploader", "")
+        )
+        if not artist or not title:
+            artist = info.get("uploader") or "Unknown Artist"
+            title = info.get("title") or "Unknown Title"
+
+        metadata = self._lookup_metadata(artist, title)
+        if not self._confirm_metadata(metadata):
+            metadata = self._manual_metadata_entry(metadata)
+
+        self._download_with_metadata(url, metadata)
 
     def _perform_download(
         self,
         url: str,
-        default_title: str = "",
-        default_uploader: str = ""
+        artist: str,
+        title: str,
+        album: Optional[str] = None,
+        album_artist: Optional[str] = None,
+        year: Optional[str] = None,
+        release_date: Optional[str] = None,
+        track_number: Optional[int] = None
     ) -> None:
         """
-        Perform the actual download with metadata input.
-        
+        Perform the actual download with metadata.
+
         Args:
             url: Download URL
-            default_title: Default video title
-            default_uploader: Default uploader name
+            artist: Artist name
+            title: Track title
+            album: Optional album name
+            album_artist: Optional album artist name
+            year: Optional release year
+            release_date: Optional release date
+            track_number: Optional track number
         """
-        artist = input("\nArtist name: ").strip() or default_uploader or "Unknown Artist"
-        title = input("Track title: ").strip() or default_title or "Unknown Title"
-        album = input("Album (optional): ").strip() or None
-        
         self._print("[green]Downloading...[/green]" if HAS_RICH else "Downloading...")
-        
+
         success = self.downloader.download_manual(
             url,
             artist,
             title,
-            album=album
+            album=album,
+            album_artist=album_artist,
+            year=year,
+            release_date=release_date,
+            track_number=track_number
         )
-        
+
         if success:
             self.db_integration.record_manual_download(artist, title, album=album)
             self._print(
@@ -223,5 +353,5 @@ class InteractiveDownloader:
             self._print(
                 "[bold red]✗ Download failed[/bold red]" if HAS_RICH else "\n✗ Download failed"
             )
-        
+
         input("\nPress Enter to continue...")

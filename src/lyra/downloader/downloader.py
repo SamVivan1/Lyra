@@ -291,3 +291,33 @@ class Downloader:
         except Exception as e:
             logger.error(f"Search failed: {e}")
             return []
+
+    def get_video_info(self, url: str) -> Dict[str, Any]:
+        """Get metadata for a video or URL using yt-dlp."""
+        command = self._get_yt_dlp_base_cmd() + [
+            "--dump-json",
+            "--skip-download",
+            url
+        ]
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if not result.stdout:
+                return {}
+
+            line = result.stdout.strip().splitlines()[0]
+            data = json.loads(line)
+            return {
+                "title": data.get("title", ""),
+                "uploader": data.get("uploader") or data.get("channel", ""),
+                "duration": data.get("duration_string") or str(data.get("duration", "N/A")),
+                "url": data.get("webpage_url") or data.get("url", url)
+            }
+        except Exception as e:
+            logger.error(f"Failed to inspect video metadata: {e}")
+            return {}
