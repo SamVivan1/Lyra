@@ -37,8 +37,17 @@ class Downloader:
         Args:
             library_path: Path to music library (default: Config.LIBRARY_PATH)
         """
-        self.library_path = Path(library_path or Config.LIBRARY_PATH)
+        self.library_path = Path(library_path or self._resolve_library_root())
         self.metadata_handler = MetadataHandler()
+        self.last_downloaded_path: Optional[str] = None
+
+    def _resolve_library_root(self) -> str:
+        """Resolve the actual library root from configuration."""
+        library_paths = Config.library_paths()
+        for path in library_paths:
+            if os.path.exists(path):
+                return path
+        return library_paths[0] if library_paths else Config.DOWNLOAD_PATH
 
     def _track_exists(self, artist: str, track: str) -> bool:
         """
@@ -114,6 +123,13 @@ class Downloader:
             Sanitized name
         """
         return re.sub(r'[<>:"/\\|?*\n\r]+', '_', (name or '').strip())
+
+    def _find_downloaded_file(self, output_folder: str, safe_title: str) -> Optional[str]:
+        """Find the downloaded mp3 file after yt-dlp finishes."""
+        candidates = glob.glob(os.path.join(output_folder, f"{safe_title}*.mp3"))
+        if candidates:
+            return os.path.abspath(candidates[0])
+        return None
 
     def _find_or_create_artist_folder(self, artist: str) -> str:
         """
@@ -211,7 +227,7 @@ class Downloader:
             query_or_url
         ]
         
-        logger.info(f"Downloading: '{artist} - {title}'")
+        logger.info(f"Downloading '{artist} - {title}' into {output_folder}")
         
         try:
             result = subprocess.run(
@@ -232,8 +248,14 @@ class Downloader:
                 release_date=release_date,
                 track_number=track_number
             )
-            
-            logger.info(f"Successfully downloaded: '{artist} - {title}'")
+
+            actual_path = self._find_downloaded_file(output_folder, safe_title)
+            if actual_path:
+                self.last_downloaded_path = actual_path
+                logger.info(f"Successfully downloaded '{artist} - {title}' to {actual_path}")
+            else:
+                self.last_downloaded_path = None
+                logger.info(f"Successfully downloaded '{artist} - {title}'")
             return True
         except subprocess.CalledProcessError as e:
             logger.error(f"yt-dlp failed: {e.stderr}")
@@ -295,7 +317,13 @@ class Downloader:
     def get_video_info(self, url: str) -> Dict[str, Any]:
         """Get metadata for a video or URL using yt-dlp."""
         command = self._get_yt_dlp_base_cmd() + [
-            "--dump-json",
+                        actual_path = self._find_downloaded_file(output_folder, safe_title)
+                        if actual_path:
+                            self.last_downloaded_path = actual_path
+                            logger.info(f"Successfully downloaded: '{artist} - {title}' to {actual_path}")
+                        else:
+                            self.last_downloaded_path = None
+                            logger.info(f"Successfully downloaded: '{artist} - {title}'")
             "--skip-download",
             url
         ]

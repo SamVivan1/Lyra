@@ -159,6 +159,8 @@ class InteractiveDownloader:
             elif char in {"q", "Q", "\x03", "\x1b"}:
                 return None
 
+                self._clear_screen()
+
     def _prompt_field(self, label: str, current_value: Optional[str] = None) -> Optional[str]:
         prompt = f"{label} [{current_value if current_value else 'none'}]: "
         value = input(prompt).strip()
