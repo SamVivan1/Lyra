@@ -317,14 +317,8 @@ class Downloader:
     def get_video_info(self, url: str) -> Dict[str, Any]:
         """Get metadata for a video or URL using yt-dlp."""
         command = self._get_yt_dlp_base_cmd() + [
-                        actual_path = self._find_downloaded_file(output_folder, safe_title)
-                        if actual_path:
-                            self.last_downloaded_path = actual_path
-                            logger.info(f"Successfully downloaded: '{artist} - {title}' to {actual_path}")
-                        else:
-                            self.last_downloaded_path = None
-                            logger.info(f"Successfully downloaded: '{artist} - {title}'")
             "--skip-download",
+            "--dump-json",
             url
         ]
 
