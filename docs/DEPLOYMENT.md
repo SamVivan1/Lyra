@@ -27,13 +27,20 @@ Mount:
 - Your music library path into the container if using downloads that place files directly into the library.
 - A local `./data` directory to persist `music_automation.db`.
 
-Example `docker-compose.yml` volume mapping:
+Example `docker-compose.yml` volume mapping for multiple library roots:
 
 ```yaml
 volumes:
   - /mnt/Storage2/data/media/Music:/mnt/Storage2/data/media/Music
+  - /mnt/Storage1/data/media/Music:/mnt/Storage1/data/media/Music
   - /DATA/Downloads:/DATA/Downloads
   - ./data:/app/data
+```
+
+Set `LIBRARY_PATH` in `.env` to include both mounted paths, for example:
+
+```env
+LIBRARY_PATH=/mnt/Storage2/data/media/Music:/mnt/Storage1/data/media/Music
 ```
 
 ## Logging

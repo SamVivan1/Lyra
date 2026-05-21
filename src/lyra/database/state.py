@@ -291,6 +291,10 @@ class StateManager:
         """
         from .library_scanner import LibraryScanner
         from ..config import Config
-        
-        scanner = LibraryScanner(Config.LIBRARY_PATH, self.db)
-        scanner.scan_library(force=force_rescan)
+
+        if force_rescan:
+            self.clear_local_library()
+
+        for library_path in Config.library_paths():
+            scanner = LibraryScanner(library_path, self.db)
+            scanner.scan_library(force=False)

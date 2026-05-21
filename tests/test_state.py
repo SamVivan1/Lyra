@@ -1,6 +1,8 @@
+import os
 import sqlite3
 import datetime
 
+from lyra.config import Config
 from lyra.database.connection import DatabaseConnection
 from lyra.database.library_scanner import LibraryScanner
 from lyra.database.state import StateManager
@@ -22,6 +24,38 @@ def test_scan_library_infers_metadata_from_path(tmp_path):
 
     assert added == 1
     assert state.track_exists(artist="Sample Artist", title="Example Track")
+
+
+def test_parse_library_paths_multiple_paths():
+    paths = Config.parse_library_paths(
+        "/mnt/Storage2/data/media/Music:/mnt/Storage1/data/media/Music"
+    )
+
+    assert paths == [
+        "/mnt/Storage2/data/media/Music",
+        "/mnt/Storage1/data/media/Music"
+    ]
+
+
+def test_ensure_library_indexed_scans_multiple_roots(tmp_path, monkeypatch):
+    root_a = tmp_path / "MusicA"
+    root_b = tmp_path / "MusicB"
+    track_a = root_a / "Sample Artist A" / "Album A" / "TrackA.mp3"
+    track_b = root_b / "Sample Artist B" / "Album B" / "TrackB.mp3"
+    track_a.parent.mkdir(parents=True, exist_ok=True)
+    track_b.parent.mkdir(parents=True, exist_ok=True)
+    track_a.write_text("")
+    track_b.write_text("")
+
+    db_path = tmp_path / "test.db"
+    db_connection = DatabaseConnection(str(db_path))
+    monkeypatch.setattr(Config, "LIBRARY_PATH", f"{root_a}{os.pathsep}{root_b}")
+
+    state = StateManager(db_connection=db_connection)
+    state.ensure_library_indexed(force_rescan=True)
+
+    assert state.track_exists(artist="Sample Artist A", title="TrackA")
+    assert state.track_exists(artist="Sample Artist B", title="TrackB")
 
 
 def test_add_tracked_track_does_not_duplicate(tmp_path):

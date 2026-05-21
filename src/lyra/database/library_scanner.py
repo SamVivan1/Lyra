@@ -60,9 +60,6 @@ class LibraryScanner:
         if force:
             logger.info("Force rescan requested - clearing local library cache")
             self.state_manager.clear_local_library()
-        elif self.state_manager.local_library_populated():
-            logger.info("Local library cache already populated, skipping scan")
-            return 0
 
         logger.info(f"Scanning music library at {self.library_path}")
         if not self.library_path.exists():

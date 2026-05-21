@@ -13,7 +13,8 @@ The application loads `.env` from the current working directory when available.
 
 - `LIDARR_URL`: Base URL for Lidarr. Defaults to `http://localhost:8686`.
 - `LIDARR_ROOT_FOLDER_PATH`: Root path as Lidarr sees it. Defaults to `/music`.
-- `LIBRARY_PATH`: Local music library path used by Lyra.
+- `LIBRARY_PATH`: One or more local music library paths used by Lyra.
+  Separate multiple paths with `:`, `,`, `;`, `|`, or newlines.
 - `DOWNLOAD_PATH`: Download folder used by the fallback downloader.
 - `DB_PATH`: SQLite database path. Defaults to `music_automation.db`.
 - `MAX_ARTISTS_PER_RUN`: Maximum number of artists to add per session.
@@ -31,7 +32,7 @@ LIDARR_API_KEY=your_lidarr_api_key
 QUALITY_PROFILE_ID=1
 METADATA_PROFILE_ID=1
 LIDARR_ROOT_FOLDER_PATH=/music
-LIBRARY_PATH=/mnt/Storage2/data/media/Music
+LIBRARY_PATH=/mnt/Storage2/data/media/Music:/mnt/Storage1/data/media/Music
 DOWNLOAD_PATH=/DATA/Downloads
 MAX_ARTISTS_PER_RUN=5
 FALLBACK_HOURS=24
@@ -44,7 +45,9 @@ API_RATE_LIMIT_DELAY=2
 
 When running Lidarr inside Docker, `LIDARR_ROOT_FOLDER_PATH` should reflect the path inside the Lidarr container, while `LIBRARY_PATH` should point to the same volume path as seen by Lyra on the host.
 
+If you have multiple mounted library roots, set `LIBRARY_PATH` to all of them separated by `:`, `,`, `;`, or `|`.
+
 Example:
 
 - `LIDARR_ROOT_FOLDER_PATH=/music`
-- `LIBRARY_PATH=/mnt/Storage2/data/media/Music`
+- `LIBRARY_PATH=/mnt/Storage2/data/media/Music:/mnt/Storage1/data/media/Music`

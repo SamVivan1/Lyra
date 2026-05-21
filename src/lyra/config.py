@@ -37,6 +37,29 @@ class Config:
     DOWNLOAD_PATH: str = os.getenv("DOWNLOAD_PATH", "/DATA/Downloads")
     DB_PATH: str = os.getenv("DB_PATH", "music_automation.db")
 
+    @classmethod
+    def parse_library_paths(cls, raw_paths: str) -> list[str]:
+        """
+        Parse one or more library paths from a single environment variable.
+
+        Supports comma, pipe, semicolon, OS path separator, and newline separators.
+        """
+        if not raw_paths:
+            return []
+
+        separators = {",", "|", ";", "\n", os.pathsep}
+        normalized = raw_paths
+        for sep in separators:
+            if sep != ",":
+                normalized = normalized.replace(sep, ",")
+
+        return [path.strip() for path in normalized.split(",") if path.strip()]
+
+    @classmethod
+    def library_paths(cls) -> list[str]:
+        """Return configured library paths as a list of absolute paths."""
+        return cls.parse_library_paths(cls.LIBRARY_PATH)
+
     # Application Configuration
     MAX_ARTISTS_PER_RUN: int = int(os.getenv("MAX_ARTISTS_PER_RUN", "5"))
     FALLBACK_HOURS: int = int(os.getenv("FALLBACK_HOURS", "24"))

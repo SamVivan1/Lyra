@@ -11,6 +11,7 @@ services:
       - .env
     volumes:
       - /mnt/Storage2/data/media/Music:/mnt/Storage2/data/media/Music
+      - /mnt/Storage1/data/media/Music:/mnt/Storage1/data/media/Music
       - /DATA/Downloads:/DATA/Downloads
       # Mount the database directory so the SQLite state is persistent
       - ./data:/app/data
