@@ -16,4 +16,5 @@ services:
       - ./data:/app/data
     environment:
       - DB_PATH=/app/data/music_automation.db
+      - PYTHONPATH=/app/src
       - TZ=Asia/Jakarta # Change to your timezone if needed

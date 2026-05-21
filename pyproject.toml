@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lyra"
+version = "1.0.0"
+description = "Self-hosted music automation that integrates ListenBrainz, Lidarr, and YouTube fallback downloads."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Lyra Contributors" }]
+dependencies = [
+    "requests>=2.31.0",
+    "yt-dlp>=2024.04.09",
+    "python-dotenv>=1.0.1",
+    "rich>=13.0.0",
+    "questionary>=2.0.0",
+    "mutagen>=1.47.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.0.0"
+]
+
+[project.scripts]
+lyra = "lyra.main:run"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lyra*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
