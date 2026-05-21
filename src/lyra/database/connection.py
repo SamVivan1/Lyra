@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator, Optional
 
+from ..config import Config
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,11 +44,8 @@ class DatabaseConnection:
                 logger.info(f"Database reinitialized for path {self._db_path}")
             return
 
-        if db_path:
-            self._db_path = Path(db_path)
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            self._db_path = Path("music_automation.db")
+        self._db_path = Path(db_path or Config.DB_PATH)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._initialize_schema()
         self._initialized = True
@@ -73,52 +72,99 @@ class DatabaseConnection:
 
     def _initialize_schema(self) -> None:
         """Initialize or migrate database schema."""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
 
-            # Artists tracking table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS artists (
-                    artist_name TEXT PRIMARY KEY,
-                    added_at TEXT NOT NULL,
-                    fallback_done INTEGER DEFAULT 0,
-                    recommended_tracks TEXT
-                )
-            ''')
+                # Artists tracking table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS artists (
+                        artist_name TEXT PRIMARY KEY,
+                        added_at TEXT NOT NULL,
+                        fallback_done INTEGER DEFAULT 0,
+                        recommended_tracks TEXT
+                    )
+                ''')
 
-            # Local library cache table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS local_library (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    artist TEXT NOT NULL,
-                    album TEXT,
-                    title TEXT NOT NULL,
-                    recording_mbid TEXT,
-                    file_path TEXT,
-                    added_at TEXT NOT NULL,
-                    UNIQUE(artist, title, recording_mbid)
-                )
-            ''')
+                # Local library cache table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS local_library (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        artist TEXT NOT NULL,
+                        album TEXT,
+                        title TEXT NOT NULL,
+                        recording_mbid TEXT,
+                        file_path TEXT,
+                        added_at TEXT NOT NULL,
+                        UNIQUE(artist, title, recording_mbid)
+                    )
+                ''')
 
-            # Tracked tracks for fallback table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS tracked_tracks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    recording_mbid TEXT,
-                    artist TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    source TEXT DEFAULT 'listenbrainz',
-                    status TEXT DEFAULT 'PENDING',
-                    added_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(recording_mbid, artist, title)
-                )
-            ''')
+                # Tracked tracks for fallback table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS tracked_tracks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        recording_mbid TEXT,
+                        artist TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        source TEXT DEFAULT 'listenbrainz',
+                        status TEXT DEFAULT 'PENDING',
+                        added_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(recording_mbid, artist, title)
+                    )
+                ''')
 
-            # Create indexes for faster queries
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_library_artist ON local_library(artist)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_library_mbid ON local_library(recording_mbid)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_tracked_tracks_status ON tracked_tracks(status)')
+                # Create indexes for faster queries
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_library_artist ON local_library(artist)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_library_mbid ON local_library(recording_mbid)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_tracked_tracks_status ON tracked_tracks(status)')
 
-            conn.commit()
-            logger.debug("Database schema initialized/verified")
+                conn.commit()
+                logger.debug("Database schema initialized/verified")
+        except sqlite3.DatabaseError as e:
+            logger.warning(f"Database file appears invalid: {self._db_path}. Attempting recovery. Error: {e}")
+            if self._db_path.exists():
+                backup_path = self._db_path.with_name(f"{self._db_path.stem}.corrupt{int(self._db_path.stat().st_mtime)}{self._db_path.suffix}")
+                self._db_path.rename(backup_path)
+                logger.warning(f"Renamed corrupt database to {backup_path}")
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS artists (
+                        artist_name TEXT PRIMARY KEY,
+                        added_at TEXT NOT NULL,
+                        fallback_done INTEGER DEFAULT 0,
+                        recommended_tracks TEXT
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS local_library (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        artist TEXT NOT NULL,
+                        album TEXT,
+                        title TEXT NOT NULL,
+                        recording_mbid TEXT,
+                        file_path TEXT,
+                        added_at TEXT NOT NULL,
+                        UNIQUE(artist, title, recording_mbid)
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS tracked_tracks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        recording_mbid TEXT,
+                        artist TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        source TEXT DEFAULT 'listenbrainz',
+                        status TEXT DEFAULT 'PENDING',
+                        added_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(recording_mbid, artist, title)
+                    )
+                ''')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_library_artist ON local_library(artist)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_library_mbid ON local_library(recording_mbid)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_tracked_tracks_status ON tracked_tracks(status)')
+                conn.commit()
+                logger.debug("Recovered and reinitialized database schema")
