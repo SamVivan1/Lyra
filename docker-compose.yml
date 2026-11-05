@@ -9,6 +9,7 @@ services:
       - 1.1.1.1
     env_file:
       - .env
+    command: ["python", "main.py", "--loop", "--interval", "3600"]
     volumes:
       - /mnt/Storage2/data/media/Music:/mnt/Storage2/data/media/Music
       - /DATA/Downloads:/DATA/Downloads
@@ -16,4 +17,6 @@ services:
       - ./data:/app/data
     environment:
       - DB_PATH=/app/data/music_automation.db
-      - TZ=Asia/Jakarta # Change to your timezone if needed
+      - TZ=Asia/Jakarta
+      - MAX_ARTISTS_PER_RUN=10
+      - FALLBACK_HOURS=6
