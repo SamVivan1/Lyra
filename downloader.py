@@ -16,8 +16,8 @@ class Downloader:
 
     def _track_exists(self, artist, track):
         """Simple deduplication check: look for similar filenames in the library."""
-        safe_artist = artist.replace('*', '').replace('?', '')
-        safe_track = track.replace('*', '').replace('?', '')
+        safe_artist = glob.escape(artist)
+        safe_track = glob.escape(track)
 
         pattern = os.path.join(self.library_path, safe_artist, "**", f"*{safe_track}*")
         matches = glob.glob(pattern, recursive=True)
@@ -150,8 +150,20 @@ class Downloader:
             result = subprocess.run(command, capture_output=True, text=True, check=True)
             logger.debug(f"yt-dlp output: {result.stdout}")
             
+            # Find the actual output file (yt-dlp might output different extension)
+            actual_output_path = None
+            for ext in ['mp3', 'm4a', 'webm', 'opus', 'ogg', 'flac', 'wav']:
+                candidate = os.path.join(output_folder, f"{safe_title}.{ext}")
+                if os.path.exists(candidate):
+                    actual_output_path = candidate
+                    break
+
+            if actual_output_path is None:
+                logger.error(f"Downloaded file not found for '{artist} - {title}'")
+                return False
+
             self._apply_metadata(
-                expected_output_path,
+                actual_output_path,
                 artist,
                 title,
                 album=album,
@@ -160,8 +172,8 @@ class Downloader:
                 release_date=release_date,
                 track_number=track_number
             )
-            
-            logger.info(f"Successfully downloaded '{artist} - {title}' to {expected_output_path}")
+
+            logger.info(f"Successfully downloaded '{artist} - {title}' to {actual_output_path}")
             return True
         except subprocess.CalledProcessError as e:
             logger.error(f"yt-dlp failed for '{artist} - {title}'. Return code: {e.returncode}")

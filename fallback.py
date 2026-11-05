@@ -23,19 +23,27 @@ class FallbackOrchestrator:
             logger.info("No artists pending fallback.")
             return
 
-        missing_artists = self.lidarr_client.get_missing_artists()
-        missing_artists_lower = [a.lower() for a in missing_artists]
-        
+        # Check if artist actually exists in Lidarr (not just missing albums)
+        existing_artists = self.lidarr_client.get_existing_artists()
+        existing_artists_lower = [a.lower() for a in existing_artists]
+
         for artist_info in pending_data:
             artist = artist_info["name"]
             recommended_tracks = artist_info["recommended_tracks"]
-            
-            # Check if Lidarr actually resolved it
-            if artist.lower() not in missing_artists_lower:
-                logger.info(f"Artist '{artist}' is no longer missing in Lidarr. Marking fallback as done.")
-                if not dry_run:
-                    self.state_manager.mark_fallback_done(artist)
-                continue
+
+            # Check if Lidarr actually has this artist
+            if artist.lower() not in existing_artists_lower:
+                logger.info(f"Artist '{artist}' not found in Lidarr yet. Triggering fallback.")
+            else:
+                # Artist exists in Lidarr - check if it has missing albums
+                missing_artists = self.lidarr_client.get_missing_artists()
+                missing_artists_lower = [a.lower() for a in missing_artists]
+                if artist.lower() not in missing_artists_lower:
+                    logger.info(f"Artist '{artist}' exists in Lidarr with all albums. Marking fallback as done.")
+                    if not dry_run:
+                        self.state_manager.mark_fallback_done(artist)
+                    continue
+                logger.info(f"Artist '{artist}' exists in Lidarr but has missing albums. Triggering fallback.")
             
             logger.info(f"Triggering fallback for '{artist}'")
             
@@ -52,13 +60,20 @@ class FallbackOrchestrator:
                 continue
                 
             success_count = 0
+            new_download_count = 0
             for track in tracks:
+                already_exists = self.downloader._track_exists(artist, track)
                 if self.downloader.download_track(artist, track, dry_run=dry_run):
                     success_count += 1
-                    
+                    if not already_exists and not dry_run:
+                        new_download_count += 1
+
             if success_count > 0:
-                logger.info(f"Fallback successful for '{artist}' ({success_count} tracks).")
-                if not dry_run:
+                logger.info(f"Fallback successful for '{artist}' ({success_count} tracks, {new_download_count} new).")
+                if not dry_run and new_download_count > 0:
+                    self.state_manager.mark_fallback_done(artist)
+                elif not dry_run:
+                    logger.info(f"All tracks already existed for '{artist}'. Marking fallback as done.")
                     self.state_manager.mark_fallback_done(artist)
             else:
                 logger.warning(f"Fallback failed for '{artist}'. Will retry later.")

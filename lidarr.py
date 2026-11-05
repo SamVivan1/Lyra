@@ -57,7 +57,14 @@ class LidarrClient:
             return False
             
         # Take the first exact or best match
-        best_match = search_results[0]
+        best_match = None
+        for result in search_results:
+            if result.get("artistName", "").lower() == artist_name.lower():
+                best_match = result
+                break
+        if best_match is None:
+            best_match = search_results[0]
+            logger.warning(f"No exact match for '{artist_name}', using first result: '{best_match.get('artistName')}'")
         
         # Build the payload using the lookup result as a base
         # This ensures we get all required fields like artistType, images, etc.
@@ -84,17 +91,23 @@ class LidarrClient:
     def get_missing_artists(self):
         """Find artists that have missing albums."""
         logger.info("Fetching missing content from Lidarr")
-        data = self._get("/api/v1/wanted/missing", params={"pageSize": 1000}) # adjust pageSize as needed
-        if data is None:
-            return []
-            
-        records = data.get("records", [])
         missing_artists = set()
-        
-        for record in records:
-            artist = record.get("artist", {})
-            artist_name = artist.get("artistName")
-            if artist_name:
-                missing_artists.add(artist_name)
-                
+        page = 1
+        while True:
+            data = self._get("/api/v1/wanted/missing", params={"pageSize": 1000, "page": page})
+            if data is None:
+                break
+
+            records = data.get("records", [])
+            for record in records:
+                artist = record.get("artist", {})
+                artist_name = artist.get("artistName")
+                if artist_name:
+                    missing_artists.add(artist_name)
+
+            total_records = data.get("totalRecords", 0)
+            if len(missing_artists) >= total_records or not records:
+                break
+            page += 1
+
         return list(missing_artists)
