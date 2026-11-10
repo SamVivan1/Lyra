@@ -125,12 +125,19 @@ Perilaku baru:
 Satu migrasi bernomor, dijalankan sekali, dengan `PRAGMA user_version` sebagai penanda:
 
 1. Backup file DB ke `<db>.backup-<ts>` (wajib, gagal → migrasi batal).
-2. Dedupe: simpan baris dengan `id` terkecil per `(artist, title)` NOCASE, gabungkan `file_path`/`recording_mbid` yang tidak NULL.
+2. Dedupe: simpan baris dengan `id` terkecil per `(artist, title)` NOCASE, dan **ambil `file_path`/`recording_mbid` dari baris `id` terkecil itu**, bukan `MAX()`.
 3. `DROP` constraint lama, `CREATE UNIQUE INDEX` baru (butuh rebuild tabel karena UNIQUE ada di definisi tabel).
 4. Tambah kolom state machine (§8.1).
 5. `PRAGMA user_version = 1`.
 
 **Keputusan saya:** rebuild tabel (CREATE new + INSERT SELECT + DROP + RENAME) di dalam satu transaksi, bukan `ALTER TABLE`, karena SQLite tidak bisa menghapus constraint UNIQUE.
+
+**Dua jebakan yang sudah saya buktikan pada spike di salinan DB (jangan diulang builder):**
+
+- **`executescript()` tidak boleh dipakai di dalam transaksi.** Method itu meng-*commit* transaksi yang sedang berjalan lebih dulu, sehingga `BEGIN`/`COMMIT` eksplisit gagal dengan `cannot commit - no transaction is active` — migrasi jadi tidak atomik. Pakai `execute()` per statement.
+- **`MAX(file_path)` memilih path secara arbitrer.** Pada data uji, baris yang bertahan justru mendapat `/music/b.mp3` (secara leksikografis lebih besar), bukan path dari baris asli. Dedupe harus memakai nilai dari baris `id` terkecil, dengan `COALESCE` ke baris lain hanya bila nilai itu NULL.
+
+Hasil spike (4 baris duplikat → 1, `integrity_check = ok`, insert duplikat ditolak `UNIQUE constraint failed`): pendekatan ini valid, dan `PRAGMA user_version = 1` bisa di-set di dalam transaksi yang sama.
 
 ### 7.5 `--dry-run` sebagai sifat lapisan, bukan parameter
 
