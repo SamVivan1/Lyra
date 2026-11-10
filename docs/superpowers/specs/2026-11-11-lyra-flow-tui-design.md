@@ -50,6 +50,7 @@ Kenapa sekarang: repo punya dua branch yang berpisah (`main` menyimpan audit fix
 |---|---|---|
 | Ambisi flow | Patch + state machine minimal (bukan queue persisten penuh) | dipilih |
 | Urutan | P0 data-safety → state machine → TUI | dipilih |
+| Agresivitas fallback | Segera (tanpa tenggang 24 jam), tetapi lewati album yang sedang ada di antrean Lidarr | dipilih |
 | Arah TUI | Hibrida: `rich` untuk render, `questionary` untuk input | dipilih |
 | Migrasi DB | Boleh migrasi skema + bersihkan duplikat lama | dipilih |
 | Git | Branch baru dari `overhaul` | dipilih |
@@ -184,7 +185,7 @@ Index: `(status, next_retry_at)`, `(artist COLLATE NOCASE, title COLLATE NOCASE)
 ### 8.2 Status dan transisi
 
 ```
-NEW ──cek Lidarr──> WAITING_LIDARR ──(waktu habis)──> QUEUED_FALLBACK
+NEW ──cek Lidarr──> WAITING_LIDARR ──(tidak di antrean / lewat FALLBACK_HOURS)──> QUEUED_FALLBACK
  │                                                        │
  └──tidak tercakup Lidarr────────────────────────────────> QUEUED_FALLBACK
                                                           │
@@ -210,17 +211,38 @@ Aturan:
 - **Batas per run**: `FALLBACK_MAX_PER_RUN` (default 10), diambil lewat `ORDER BY next_retry_at LIMIT n`.
 - **Filter umur pindah ke SQL**, bukan Python: `WHERE status='QUEUED_FALLBACK' AND COALESCE(next_retry_at, added_at) <= ?`.
 
-**Keputusan saya:** `WAITING_LIDARR` dipertahankan sebagai status (bukan flag) karena ia punya arti berbeda saat dibaca operator — "sedang menunggu Lidarr" vs "gagal, akan dicoba lagi".
+**Keputusan saya:** `WAITING_LIDARR` dipertahankan sebagai status (bukan flag) karena ia punya arti berbeda saat dibaca operator — "Lidarr sedang mengerjakan ini" vs "gagal, akan dicoba lagi". Setelah keputusan pemilik produk di §8.3, status ini berarti **"album sedang ada di antrean unduh Lidarr"**, bukan "menunggu tenggat waktu".
+
+**Peran `FALLBACK_HOURS` berubah** (keputusan pemilik produk): ia bukan lagi masa tenggang sebelum cek pertama, melainkan **batas maksimum sebuah track boleh menunggu di `WAITING_LIDARR`**. Kalau album sudah 24 jam di antrean Lidarr dan belum juga selesai, track dipindahkan ke `QUEUED_FALLBACK` — supaya antrean Lidarr yang macet tidak membekukan fallback selamanya. Nama kuncinya dipertahankan agar `.env` yang ada tetap bermakna; dokumentasinya yang berubah.
 
 ### 8.3 Cek Lidarr sebelum fallback
 
-Langkah yang hari ini hilang. Sebelum track masuk `QUEUED_FALLBACK`, orchestrator memanggil `GET /api/v1/wanted/missing` (dengan pagination penuh) dan menyimpan hasilnya sekali per run:
+Langkah yang hari ini hilang. Sekali per run, orchestrator mengambil **dua** hal dari Lidarr, keduanya dengan pagination penuh, lalu memakainya untuk semua track:
 
-- Track yang artistnya masih diproses Lidarr → `WAITING_LIDARR`, `lidarr_checked_at=now`.
-- Track yang tidak tercakup → `QUEUED_FALLBACK`.
-- **Kalau Lidarr tidak bisa dihubungi**, jangan simpulkan apa pun: semua track tetap `NEW` dan run berhenti dengan error jelas. Ini memperbaiki bug hari ini di mana timeout Lidarr membuat `existing_artists=[]` sehingga semua artis dianggap baru.
+- `GET /api/v1/wanted/missing` — album yang diketahui Lidarr tapi belum dimiliki.
+- `GET /api/v1/queue` — unduhan yang **sedang berjalan** di Lidarr.
+
+**Keputusan pemilik produk:** fallback berjalan segera — tidak ada masa tenggang 24 jam — tetapi album yang **sedang ada di antrean Lidarr dilewati**, supaya YouTube tidak mengunduh hal yang sedang diunduh Lidarr.
+
+Tabel keputusan per track:
+
+| Kondisi di Lidarr | Status |
+|---|---|
+| Lidarr tidak terjangkau | tetap `NEW`; run berhenti dengan error jelas |
+| Artis tidak ada di Lidarr dan tidak akan pernah ada (lookup tanpa exact match, atau `add_artist` gagal permanen) | `QUEUED_FALLBACK` segera |
+| Artis punya album hilang **dan** album itu ada di `/queue` (Lidarr sedang mengunduh) | `WAITING_LIDARR`, `lidarr_checked_at=now` |
+| Artis punya album hilang dan album itu **tidak** ada di `/queue` | `QUEUED_FALLBACK` segera |
+| Artis tidak dilaporkan punya album hilang | cek `local_library`; kalau track memang tidak ada → pindai ulang sekali, lalu `QUEUED_FALLBACK` |
+
+Tiga hal yang menjaga tabel ini tidak salah simpul:
+
+1. **Lidarr tidak bisa dihubungi bukan berarti "kosong".** Semua track tetap `NEW` dan run berhenti dengan error. Ini memperbaiki bug hari ini, di mana timeout Lidarr membuat `existing_artists=[]` sehingga semua artis dianggap baru lalu ditambahkan ulang.
+2. **Artis yang baru ditambahkan di run yang sama tidak boleh dinilai "lengkap" dari daftar missing yang kosong.** Lidarr memetakan album secara asinkron; daftar kosong saat itu berarti "belum tahu", bukan "sudah punya". Track milik artis seperti itu tetap `NEW` sampai run berikutnya.
+3. **Kegagalan sementara ≠ kegagalan permanen.** `add_artist` yang gagal karena `APIError` (jaringan/5xx) meninggalkan track di `NEW` untuk dicoba lagi; hanya kegagalan yang bersifat permanen (lookup tanpa exact match) yang langsung masuk `QUEUED_FALLBACK`.
 
 `artists.fallback_done` dan `get_pending_fallback_artists()` dihapus bersama kolomnya (dead code).
+
+**Perlu verifikasi sebelum implementasi:** bentuk respons `GET /api/v1/queue` (apakah ia memuat `albumId`/`artistId`, atau hanya judul) belum bisa saya pastikan karena Lidarr pada mesin ini tidak terjangkau. Kalau queue tidak memberi id album, pencocokan turun ke nama artis + judul album, dan itu harus dicatat sebagai keterbatasan. Kalau endpoint-nya tidak ada di versi Lidarr pengguna, desain mundur ke: perlakukan "artist punya album hilang" sebagai pemicu langsung dan terima risiko duplikasi.
 
 ### 8.4 Download yang jujur
 
@@ -359,3 +381,5 @@ Setiap iterasi berdiri sendiri dan bisa dirilis.
 3. **Progres yt-dlp** bergantung pada `--progress-template`; sudah dirancang opsional.
 4. **Migrasi rebuild tabel** menyentuh seluruh `local_library`; wajib backup + diuji pada salinan DB nyata sebelum dijalankan di data pengguna.
 5. **`main` dan `overhaul` tetap berpisah.** 6 fix dari `main` (glob.escape, exact match, pagination, WAL, log Docker, cek file hasil unduhan) diangkat ulang sebagai bagian iterasi 1–2, lalu `main` ditutup agar tidak ada dua sumber kebenaran.
+6. **`GET /api/v1/queue` belum terverifikasi** (Lidarr pada mesin ini tidak terjangkau). Ini satu-satunya bagian desain yang bergantung pada asumsi tentang API eksternal; §8.3 menuliskan rencana mundurnya bila bentuk responsnya tidak memuat id album.
+7. **Fallback agresif memperbesar beban YouTube.** Tanpa tenggang, satu run bisa mengantrekan banyak track sekaligus. Batas `FALLBACK_MAX_PER_RUN` (default 10) dan jeda antar-unduh menjadi pengaman wajib, bukan opsional.
