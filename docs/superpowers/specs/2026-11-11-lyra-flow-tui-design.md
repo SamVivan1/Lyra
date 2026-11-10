@@ -122,13 +122,16 @@ Perilaku baru:
 
 ### 7.4 Migrasi
 
-Satu migrasi bernomor, dijalankan sekali, dengan `PRAGMA user_version` sebagai penanda:
+Satu migrasi bernomor, dijalankan sekali, dengan `PRAGMA user_version` sebagai penanda. Semua langkah berjalan dalam **satu** transaksi `BEGIN IMMEDIATE`:
 
-1. Backup file DB ke `<db>.backup-<ts>` (wajib, gagal → migrasi batal).
-2. Dedupe: simpan baris dengan `id` terkecil per `(artist, title)` NOCASE, dan **ambil `file_path`/`recording_mbid` dari baris `id` terkecil itu**, bukan `MAX()`.
-3. `DROP` constraint lama, `CREATE UNIQUE INDEX` baru (butuh rebuild tabel karena UNIQUE ada di definisi tabel).
-4. Tambah kolom state machine (§8.1).
-5. `PRAGMA user_version = 1`.
+1. Backup file DB ke `<db>.backup-<ts>-<pid>` (wajib; gagal → migrasi batal). Nama memuat `pid` supaya dua proses tidak bertabrakan.
+2. Dedupe `local_library`: pemenang = baris `id` terkecil per `(artist, title)` NOCASE. Untuk kolom non-kunci, `file_path`/`recording_mbid` memakai nilai pemenang, dan hanya bila NULL diambil dari baris berikutnya menurut `id` yang tidak NULL.
+3. **Baris yang kalah tidak dibuang diam-diam.** Bila punya `file_path` non-NULL yang berbeda dari pemenang, path itu ditulis ke `migration-duplicates-<ts>.txt` di samping DB (satu baris per path, dengan `id`, artis, judul). File audionya tidak disentuh — hanya barisnya yang tidak lagi terindeks, dan operator punya daftarnya.
+4. Dedupe `tracked_tracks`: pemenang ditentukan **prioritas status** `COMPLETED > RUNNING > QUEUED_FALLBACK > WAITING_LIDARR > NEW > FAILED > DEAD`, lalu `id` terkecil. `attempts` = `MAX(attempts)` dari semua baris yang digabung; `last_error` ikut pemenang.
+5. **Pemetaan status lama**: `PENDING` → `NEW` (dievaluasi ulang lewat cek Lidarr, **bukan** langsung diantrekan ke YouTube), `COMPLETED` tetap `COMPLETED`, nilai lain → `NEW`. `attempts = 0`, `next_retry_at = NULL`.
+6. `artists.fallback_done` di-*drop*: di branch ini kolom itu tidak pernah di-set — satu-satunya penulisnya (`mark_fallback_done`) adalah dead code dengan 0 pemanggil, jadi nilainya dijamin 0 dan tidak ada informasi yang hilang.
+7. Rebuild `local_library` (CREATE new + INSERT SELECT + DROP + RENAME) untuk membuang constraint UNIQUE lama, lalu tambah unique index natural dan kolom state machine (§8.1).
+8. `PRAGMA user_version = 1`.
 
 **Keputusan saya:** rebuild tabel (CREATE new + INSERT SELECT + DROP + RENAME) di dalam satu transaksi, bukan `ALTER TABLE`, karena SQLite tidak bisa menghapus constraint UNIQUE.
 
@@ -145,7 +148,7 @@ Akar bug: `dry_run` dicek di tempat yang salah (dan lupa diteruskan ke mode inte
 
 - `StateManager`/`TrackStateManager` menerima `dry_run: bool` saat konstruksi.
 - Semua method yang menulis mengembalikan hasil simulasi tanpa menyentuh DB.
-- `Downloader` menerima `dry_run` yang sama dan menolak memanggil `yt-dlp`.
+- `Downloader` menerima `dry_run` yang sama, tetapi **hanya memblokir operasi yang mengubah sesuatu** (`download_manual` → subprocess unduh, tulis file, tag). Panggilan baca-saja tetap jalan: `get_search_results` dan `get_video_info` harus tetap bekerja, kalau tidak mode interaktif `--dry-run` tidak akan pernah bisa mencapai layar unduh untuk disimulasikan. Jadi `dry_run` adalah properti konstruktor, dengan satu pengecualian eksplisit untuk dua method baca-saja itu.
 - `InteractiveDownloader` menerima `dry_run` dari `main.py` dan menampilkan badge `DRY RUN` permanen di header.
 
 **Keputusan saya:** flag di konstruktor, bukan parameter per method — supaya tidak ada jalur tulis yang bisa lupa.
@@ -225,7 +228,10 @@ Langkah yang hari ini hilang. Sebelum track masuk `QUEUED_FALLBACK`, orchestrato
 - `--no-playlist` ditambahkan; template output memuat `%(id)s` agar judul kembar tidak tertukar.
 - Path hasil diambil dari `--print after_move:filepath`, bukan glob judul.
 - `download_track` mengembalikan path file (atau `None`), bukan `bool`. Pemanggil mencatat `file_path` itu ke DB.
-- Tagging gagal = unduhan gagal (tidak boleh `return True`).
+- Tagging gagal = unduhan gagal (tidak boleh `return True`), **tapi file yang sudah terunduh tidak dihapus.** Status menjadi `FAILED` dengan `last_error="tagging failed"` dan `file_path` tetap dicatat.
+- **Retry tidak boleh mengunduh ulang bila file target sudah ada.** Sebelum memanggil yt-dlp, `download_manual` memeriksa: kalau file tujuan ada dan status terakhir `FAILED` karena tagging, ia hanya men-tag ulang. Tanpa ini, retry akan memakai `--print after_move` yang tidak mengeluarkan apa pun (yt-dlp menganggap sudah terunduh), lalu track menghabiskan 5 percobaan sampai `DEAD` padahal audionya ada di disk.
+- **Satu mekanisme subprocess.** `Downloader` selalu memakai `Popen` (bukan campuran `run`/`Popen`) dengan `progress_callback: Optional[Callable]`. Mode batch mengirim `None` dan tidak ada yang mengonsumsi progres; mode interaktif mengirim callback ke `rich.progress`. Kontrak tunggal: `download_track(...) -> Optional[str]` (path file atau `None`). Iterasi 2 sudah berbentuk `Popen` supaya iterasi 3 tidak menulis ulang modul ini.
+- **DB hanya otoritatif setelah scan.** `local_library` dipangkas saat scan: baris yang file-nya tidak lagi ada di disk ditandai hilang (bukan langsung dihapus) dan tidak dihitung sebagai "sudah ada". Tanpa ini, menghapus file dari disk membuat track selamanya dianggap selesai.
 - `_track_exists` diganti query DB (`track_exists`), bukan glob filesystem. Kalau tetap perlu cek file, pakai `os.scandir` per folder artis, bukan `**` glob.
 - Nama artis/judul ditolak bila `""`, `"."`, `".."`; setelah join, verifikasi `os.path.commonpath([root, target]) == root`.
 - `yt-dlp` dipanggil sebagai `sys.executable -m yt_dlp` supaya tidak bergantung PATH.
@@ -250,6 +256,7 @@ Langkah yang hari ini hilang. Sebelum track masuk `QUEUED_FALLBACK`, orchestrato
 - `LOG_LEVEL` benar-benar dipakai sebagai default `--log-level`.
 - `parse_library_paths` dedupe (`dict.fromkeys`) dan tidak memakai `os.pathsep` sebagai pemisah.
 - Validasi per-mode: mode interaktif tidak menuntut kredensial Lidarr/ListenBrainz.
+- **Log punya path dan rotasi yang eksplisit** (ini yang di §13 disebut "log Docker", sebelumnya tidak dispesifikkan): kunci baru `LOG_FILE`, default `<direktori DB>/lyra.log` — sehingga di container ia jatuh ke volume `./data` dan tidak hilang saat restart. `RotatingFileHandler(maxBytes=10MB, backupCount=5)`. Saat berjalan di container, log tetap juga ke `stdout` supaya `docker logs` bekerja; saat TUI aktif, handler konsol pindah ke `stderr` (§9.3).
 
 ---
 
@@ -313,6 +320,12 @@ Test yang **wajib** ada karena mengunci P0 (semua ini saat ini tidak ada):
 CI (`.github/workflows/ci.yml`): matrix Python 3.10–3.13, `pip install -e ".[dev]"`, `pytest`, `ruff check`, `mypy`, `docker build`. Test harus **hermetik**: fixture `autouse` memaksa `Config.DB_PATH` ke `tmp_path` dan me-reset singleton.
 
 `DatabaseConnection` berhenti menjadi singleton (DI sudah setengah ada di semua konstruktor) — ini yang membuat test bisa hermetik.
+
+**Inisialisasi dan migrasi tidak boleh implisit di konstruktor** (konsekuensi dari menghapus singleton + goal 2 yang mengizinkan dua proses start bersamaan):
+
+- `main()` memanggil `initialize()` **sekali**, eksplisit, sebelum komponen lain dibuat; semua komponen menerima objek lewat DI dan tidak pernah memicu migrasi sendiri.
+- Di dalam `initialize()`, seluruh pemeriksaan versi + backup + rebuild berjalan dalam `BEGIN IMMEDIATE`. `BEGIN IMMEDIATE` mengambil write-lock di awal, jadi proses kedua menunggu (sampai `busy_timeout`) lalu membaca `user_version = 1` dan **melewati** migrasi. Ini yang mencegah dua proses men-backup dan me-rebuild tabel bersamaan.
+- `PRAGMA integrity_check` hanya dijalankan setelah migrasi selesai atau saat `--repair-db`; ia bukan bagian dari jalur start normal (mahal untuk library besar).
 
 ---
 
