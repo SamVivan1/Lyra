@@ -131,6 +131,7 @@ Examples:
 
     # Initialize components
     db_connection = DatabaseConnection(Config.DB_PATH)
+    db_connection.initialize()
     orchestrator = ApplicationOrchestrator(db_connection)
 
     # Ensure library is indexed

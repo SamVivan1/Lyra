@@ -11,6 +11,7 @@ from lyra.downloader.fallback_orchestrator import FallbackOrchestrator
 def test_run_fallback_completes_missing_track(tmp_path):
     db_path = tmp_path / "test.db"
     db_connection = DatabaseConnection(str(db_path))
+    db_connection.initialize()
     state_manager = StateManager(db_connection=db_connection)
     track_manager = TrackStateManager(db_connection=db_connection)
     track_manager.add_tracked_track(None, "Fallback Artist", "Fallback Song")
@@ -34,6 +35,7 @@ def test_run_fallback_completes_missing_track(tmp_path):
 def test_run_fallback_skips_existing_local_track(tmp_path):
     db_path = tmp_path / "test.db"
     db_connection = DatabaseConnection(str(db_path))
+    db_connection.initialize()
     state_manager = StateManager(db_connection=db_connection)
     track_manager = TrackStateManager(db_connection=db_connection)
 

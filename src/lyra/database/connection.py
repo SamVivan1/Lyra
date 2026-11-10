@@ -1,14 +1,14 @@
 """
 Database connection and initialization utilities.
 
-Handles SQLite connection pooling and schema migrations.
+Handles SQLite connections and schema initialization.
 """
 
 import sqlite3
 import logging
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Generator, Optional, Union
 
 from ..config import Config
 
@@ -17,39 +17,40 @@ logger = logging.getLogger(__name__)
 
 class DatabaseConnection:
     """
-    Singleton database connection manager with schema initialization.
-    
-    Thread-safe database connection factory that manages SQLite schema
-    creation and migrations.
+    SQLite connection factory with an explicit two-phase lifecycle.
+
+    The constructor only records the database path; it never touches disk, so
+    constructing many instances in tests is free and hermetic. Call
+    ``initialize()`` once before use to create the parent directory, apply the
+    concurrency PRAGMAs and build the schema.
     """
 
-    _instance: Optional['DatabaseConnection'] = None
-    _db_path: Optional[Path] = None
-    _initialized: bool = False
+    def __init__(self, path: Optional[Union[str, Path]] = None) -> None:
+        """
+        Record the database path without touching disk.
 
-    def __new__(cls, db_path: Optional[str] = None) -> 'DatabaseConnection':
-        """Ensure singleton pattern across the application."""
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+        Args:
+            path: Database file path. Defaults to ``Config.DB_PATH``.
+        """
+        self.path = Path(path or Config.DB_PATH)
+        self._initialized = False
 
-    def __init__(self, db_path: Optional[str] = None) -> None:
-        """Initialize database connection and schema if first instantiation."""
-        if self._initialized:
-            if db_path and self._db_path != Path(db_path):
-                self._db_path = Path(db_path)
-                self._db_path.parent.mkdir(parents=True, exist_ok=True)
-                self._initialize_schema()
-                logger.info(f"Database reinitialized for path {self._db_path}")
-            return
+    def initialize(self) -> None:
+        """
+        Create the database file, apply concurrency PRAGMAs and the schema.
 
-        self._db_path = Path(db_path or Config.DB_PATH)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        self._initialize_schema()
+        Runs ``PRAGMA journal_mode=WAL``, ``PRAGMA busy_timeout=5000`` and
+        ``PRAGMA synchronous=NORMAL`` in that order, then initializes the
+        schema. Must be called before ``get_connection()`` is used.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.get_connection() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._initialize_schema()
         self._initialized = True
-        logger.info(f"Database initialized at {self._db_path}")
+        logger.info(f"Database initialized at {self.path}")
 
     @contextmanager
     def get_connection(self) -> Generator[sqlite3.Connection, None, None]:
@@ -59,8 +60,10 @@ class DatabaseConnection:
         Yields:
             sqlite3.Connection: Database connection with Row factory enabled.
         """
-        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         try:
             yield conn
         except sqlite3.Error as e:
@@ -123,10 +126,10 @@ class DatabaseConnection:
                 conn.commit()
                 logger.debug("Database schema initialized/verified")
         except sqlite3.DatabaseError as e:
-            logger.warning(f"Database file appears invalid: {self._db_path}. Attempting recovery. Error: {e}")
-            if self._db_path.exists():
-                backup_path = self._db_path.with_name(f"{self._db_path.stem}.corrupt{int(self._db_path.stat().st_mtime)}{self._db_path.suffix}")
-                self._db_path.rename(backup_path)
+            logger.warning(f"Database file appears invalid: {self.path}. Attempting recovery. Error: {e}")
+            if self.path.exists():
+                backup_path = self.path.with_name(f"{self.path.stem}.corrupt{int(self.path.stat().st_mtime)}{self.path.suffix}")
+                self.path.rename(backup_path)
                 logger.warning(f"Renamed corrupt database to {backup_path}")
             with self.get_connection() as conn:
                 cursor = conn.cursor()

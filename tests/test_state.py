@@ -17,6 +17,7 @@ def test_scan_library_infers_metadata_from_path(tmp_path):
 
     db_path = tmp_path / "test.db"
     db_connection = DatabaseConnection(str(db_path))
+    db_connection.initialize()
     scanner = LibraryScanner(str(library_path), db_connection=db_connection)
     added = scanner.scan_library(force=True)
 
@@ -49,6 +50,7 @@ def test_ensure_library_indexed_scans_multiple_roots(tmp_path, monkeypatch):
 
     db_path = tmp_path / "test.db"
     db_connection = DatabaseConnection(str(db_path))
+    db_connection.initialize()
     monkeypatch.setattr(Config, "LIBRARY_PATH", f"{root_a}{os.pathsep}{root_b}")
 
     state = StateManager(db_connection=db_connection)
@@ -61,6 +63,7 @@ def test_ensure_library_indexed_scans_multiple_roots(tmp_path, monkeypatch):
 def test_add_tracked_track_does_not_duplicate(tmp_path):
     db_path = tmp_path / "test.db"
     db_connection = DatabaseConnection(str(db_path))
+    db_connection.initialize()
     track_manager = TrackStateManager(db_connection=db_connection)
 
     first = track_manager.add_tracked_track(None, "Artist", "Title")
@@ -73,6 +76,7 @@ def test_add_tracked_track_does_not_duplicate(tmp_path):
 def test_get_pending_tracked_tracks_returns_overdue(tmp_path):
     db_path = tmp_path / "test.db"
     db_connection = DatabaseConnection(str(db_path))
+    db_connection.initialize()
     track_manager = TrackStateManager(db_connection=db_connection)
     track_manager.add_tracked_track(None, "Artist", "Old Title")
 
