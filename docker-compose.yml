@@ -14,6 +14,9 @@ services:
     # Run unprivileged; keep the UID/GID aligned with the owner of ./data.
     user: "${LYRA_UID:-1000}:${LYRA_GID:-1000}"
     volumes:
+      # LIBRARY_PATH in .env points here; without this mount the container has no
+      # such directory and a download fails trying to create /home/samvivan.
+      - /home/samvivan/Music:/home/samvivan/Music
       - /mnt/Storage2/data/media/Music:/mnt/Storage2/data/media/Music
       - /mnt/Storage1/data/media/Music:/mnt/Storage1/data/media/Music
       - /DATA/Downloads:/DATA/Downloads
