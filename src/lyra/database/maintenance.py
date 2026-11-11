@@ -63,6 +63,40 @@ def _free_backup_path(db_path: Path) -> Path:
     return candidate
 
 
+def _free_rebuild_path(db_path: Path) -> Path:
+    """Return an unused path to build the replacement database at.
+
+    The replacement is built beside the live file, under a name of its own, and
+    renamed over it only after it passes its integrity check. Keeping it in the
+    same directory matters: ``os.replace`` is atomic only within a filesystem,
+    and a rebuild that failed must never be able to touch the original.
+    """
+    stem = f"{db_path.name}.rebuild-{int(time.time())}-{os.getpid()}"
+    candidate = db_path.with_name(stem)
+    counter = 1
+    while candidate.exists():
+        candidate = db_path.with_name(f"{stem}-{counter}")
+        counter += 1
+    return candidate
+
+
+def _discard_rebuild(rebuild_path: Path) -> None:
+    """Remove a replacement that is not going to be renamed into place.
+
+    Its sidecars go with it: a leftover ``-wal`` from a failed rebuild would be
+    replayed into the next file that carried that name.
+    """
+    for path in (
+        rebuild_path,
+        _sidecar(rebuild_path, WAL_SUFFIX),
+        _sidecar(rebuild_path, SHM_SUFFIX),
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"Could not remove the abandoned rebuild {path}: {e}")
+
+
 def backup_database(db_path: Path) -> Path:
     """
     Copy the database file to a fresh backup path and return that path.
@@ -96,11 +130,18 @@ def backup_database(db_path: Path) -> Path:
 
 def repair_database(db_path: Path) -> RepairReport:
     """
-    Back ``db_path`` up, then rebuild an empty database with a fresh schema.
+    Back ``db_path`` up, then replace it with a fresh, empty database.
 
     The backup always happens first, so an unbacked file is never touched. The
-    old file and its sidecars are then removed rather than renamed: a leftover
-    ``-wal`` beside the rebuilt file would be replayed into it.
+    replacement is then built under a name of its own beside the live file and
+    renamed into place only after it passes ``PRAGMA integrity_check``. That
+    order is the safety property: a rebuild that fails leaves the operator's
+    database exactly where it was, and every failure message names the backup,
+    because that copy is the only one that still holds the old rows.
+
+    The old sidecars are removed before the rename, and the replacement's own
+    are checkpointed away before it moves: a ``-wal`` belongs to the file it is
+    named after, so one left beside the new file would be replayed into it.
 
     The row counts in the report are the rows of the **old** file, counted in the
     backup taken a moment earlier. That is what the operator needs: the rebuilt
@@ -114,33 +155,84 @@ def repair_database(db_path: Path) -> RepairReport:
         A :class:`RepairReport` naming the backup and saying what it held.
 
     Raises:
-        DatabaseFileError: If the backup or the replacement could not be done.
+        DatabaseFileError: If the backup, the rebuild or the replacement could
+            not be done. The original file survives every one of those.
     """
     db_path = Path(db_path)
     backup_path = backup_database(db_path)
     # Counted before the old file is replaced, and from the backup, so the
     # numbers describe the file as it was backed up even if a later step fails.
     lost_rows = _lost_row_counts(backup_path)
+
+    rebuild_path = _free_rebuild_path(db_path)
     try:
-        for path in (
-            db_path,
-            _sidecar(db_path, WAL_SUFFIX),
-            _sidecar(db_path, SHM_SUFFIX),
-        ):
-            path.unlink(missing_ok=True)
-    except OSError as e:
+        DatabaseConnection(rebuild_path).initialize()
+        if not integrity_ok(rebuild_path):
+            raise DatabaseFileError(
+                db_path,
+                "rebuild",
+                f"the replacement at {rebuild_path} failed PRAGMA integrity_check "
+                f"(a backup of the old database is at {backup_path})",
+            )
+        _seal_rebuild(rebuild_path)
+        _install_rebuild(db_path, rebuild_path, backup_path)
+    except DatabaseFileError:
+        _discard_rebuild(rebuild_path)
+        raise
+    except (sqlite3.Error, OSError) as e:
+        # A rebuild failure must reach the operator as one actionable line that
+        # names the backup -- and it must never take the live file with it, which
+        # is why the rebuild happened at a path of its own.
+        _discard_rebuild(rebuild_path)
         raise DatabaseFileError(
             db_path,
-            "replace",
-            f"{e} (a backup was already written to {backup_path})",
+            "rebuild",
+            f"{e} (a backup of the old database is at {backup_path})",
         ) from e
-
-    DatabaseConnection(db_path).initialize()
     return RepairReport(
         backup_path=backup_path,
         tables=lost_rows,
         integrity_ok=integrity_ok(db_path),
     )
+
+
+def _seal_rebuild(rebuild_path: Path) -> None:
+    """
+    Fold the replacement's WAL into it and drop its sidecars.
+
+    ``initialize()`` leaves a WAL-mode database, and a WAL may still hold commits
+    that are not in the main file. Renaming only the main file would leave those
+    commits behind under the old name, so they are checkpointed in first; the
+    emptied sidecars are then removed and the file stands alone.
+    """
+    conn = sqlite3.connect(rebuild_path)
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    for suffix in (WAL_SUFFIX, SHM_SUFFIX):
+        _sidecar(rebuild_path, suffix).unlink(missing_ok=True)
+
+
+def _install_rebuild(db_path: Path, rebuild_path: Path, backup_path: Path) -> None:
+    """
+    Put a verified replacement where the live database was.
+
+    The old file is not removed first: ``os.replace`` swaps the two atomically,
+    so the live database exists until the replacement is there. Only the old
+    sidecars are removed beforehand, because they belong to the file being
+    replaced and would be replayed into its successor.
+    """
+    try:
+        for suffix in (WAL_SUFFIX, SHM_SUFFIX):
+            _sidecar(db_path, suffix).unlink(missing_ok=True)
+        os.replace(rebuild_path, db_path)
+    except OSError as e:
+        raise DatabaseFileError(
+            db_path,
+            "replace",
+            f"{e} (a backup of the old database is at {backup_path})",
+        ) from e
 
 
 def _lost_row_counts(backup_path: Path) -> dict[str, int]:

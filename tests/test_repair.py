@@ -9,11 +9,22 @@ import pytest
 
 import lyra.main as main_module
 from lyra.config import Config
+from lyra.database import maintenance
 from lyra.database.connection import DatabaseConnection
 from lyra.database.errors import DatabaseFileError
 from lyra.database.maintenance import backup_database, repair_database
 
 GARBAGE = b"this is not a database at all"
+
+
+class _FailingRebuildConnection:
+    """A replacement connection whose rebuild fails, for the failure-path test."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def initialize(self):
+        raise sqlite3.OperationalError("disk I/O error")
 
 
 def test_lock_is_not_treated_as_corruption(tmp_path):
@@ -246,3 +257,72 @@ def test_main_reports_a_sqlite_failure_without_raising(tmp_path, monkeypatch, ca
 
     assert exit_code != 0
     assert str(db_path) in caplog.text
+
+
+def test_dry_run_with_repair_db_is_refused_before_it_touches_the_database(
+    tmp_path, monkeypatch, caplog
+):
+    """``--dry-run`` promises nothing is written; ``--repair-db`` rebuilds empty.
+
+    Both cannot be honoured at once, so the combination is refused before any
+    mode is dispatched. The regression this pins is severe: repair ran first and
+    never read ``args.dry_run``, so ``lyra --dry-run --repair-db`` emptied a
+    healthy database and exited 0.
+    """
+    db_path = tmp_path / "live.db"
+    DatabaseConnection(db_path).initialize()
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO local_library (artist, title, added_at) VALUES (?, ?, ?)",
+            [("Autechre", "Amber", "2026-01-01"), ("Autechre", "Nil", "2026-01-01")],
+        )
+    before = db_path.read_bytes()
+
+    monkeypatch.setattr(sys, "argv", ["lyra", "--dry-run", "--repair-db"])
+    monkeypatch.setattr(Config, "DB_PATH", str(db_path))
+    monkeypatch.setattr(main_module, "setup_logging", lambda *_a, **_k: None)
+
+    with caplog.at_level(logging.ERROR):
+        exit_code = main_module.main()
+
+    assert exit_code != 0, "a refused combination must not exit 0"
+    assert "--repair-db" in caplog.text and "--dry-run" in caplog.text
+    # Nothing was repaired, backed up or rebuilt: the database is byte-identical.
+    assert db_path.read_bytes() == before
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM local_library").fetchone()[0] == 2
+    assert not list(tmp_path.glob("live.db.backup-*"))
+
+
+def test_a_failed_rebuild_leaves_the_original_database_and_names_the_backup(
+    tmp_path, monkeypatch, caplog
+):
+    """A repair that cannot finish must not take the file it was repairing with it.
+
+    The live file used to be unlinked before the rebuild, so a rebuild failure
+    left no database at all, and the raw ``OperationalError`` never mentioned the
+    backup -- the one copy that still held the rows.
+    """
+    db_path = tmp_path / "live.db"
+    DatabaseConnection(db_path).initialize()
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO local_library (artist, title, added_at) VALUES (?, ?, ?)",
+            [("Autechre", "Amber", "2026-01-01"), ("Autechre", "Nil", "2026-01-01")],
+        )
+    before = db_path.read_bytes()
+
+    monkeypatch.setattr(maintenance, "DatabaseConnection", _FailingRebuildConnection)
+
+    with caplog.at_level(logging.ERROR):
+        exit_code = main_module.repair_database_mode(str(db_path))
+
+    assert exit_code != 0
+    backups = list(tmp_path.glob("live.db.backup-*"))
+    assert backups, "the old rows must still exist in a backup"
+    assert str(backups[0]) in caplog.text, "the message must point at the backup"
+    assert db_path.exists(), "the original database must survive a failed rebuild"
+    assert db_path.read_bytes() == before
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM local_library").fetchone()[0] == 2
+    assert not list(tmp_path.glob("live.db.rebuild-*")), "no abandoned replacement"

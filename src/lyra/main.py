@@ -47,7 +47,10 @@ def repair_database_mode(db_path: str) -> int:
     """
     try:
         report = repair_database(Path(db_path))
-    except (DatabaseCorruptError, DatabaseFileError) as e:
+    except (DatabaseCorruptError, DatabaseFileError, sqlite3.Error) as e:
+        # sqlite3.Error is included so a rebuild failure can never escape as a
+        # raw traceback: the operator needs the exit code and, above all, the
+        # path of the backup that still holds their data.
         logger.error(str(e))
         return 1
 
@@ -250,6 +253,20 @@ Examples:
     logger.info("=" * 60)
     logger.info("Lyra Music Automation System - Starting")
     logger.info("=" * 60)
+
+    # Refused before any dispatch, because there is no honest way to honour both:
+    # --repair-db rebuilds the file empty, which is the opposite of what --dry-run
+    # promises. The old order reached repair_database_mode without ever reading
+    # args.dry_run, so `lyra --dry-run --repair-db` destroyed the database and
+    # exited 0 -- a silent data loss, which the design's anti-goals forbid.
+    if args.repair_db and args.dry_run:
+        logger.error(
+            "--dry-run cannot be combined with --repair-db: --repair-db rewrites "
+            "the database file empty, which is exactly what --dry-run promises not "
+            "to do. Nothing was changed. Run 'lyra --repair-db' on its own (it backs "
+            "the old file up first), or 'lyra --dry-run' to simulate a normal run."
+        )
+        return 2
 
     # Explicit repair runs before any other mode. It has to: the file it repairs
     # may be one that normal startup cannot open at all.
