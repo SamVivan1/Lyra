@@ -30,10 +30,18 @@ Lyra uses SQLite3 with three main tables for state management:
 │  │ artist                │                       │
 │  │ title                 │                       │
 │  │ source (listenbrainz) │                       │
-│  │ status (PENDING,      │                       │
-│  │         COMPLETED)    │                       │
+│  │ status (NEW,          │                       │
+│  │   QUEUED_FALLBACK,    │                       │
+│  │   RUNNING, COMPLETED, │                       │
+│  │   WAITING_LIDARR,     │                       │
+│  │   FAILED, DEAD)       │                       │
 │  │ added_at              │                       │
-│  │ completed_at          │                       │
+│  │ updated_at            │                       │
+│  │ attempts              │                       │
+│  │ last_attempt_at       │                       │
+│  │ next_retry_at         │                       │
+│  │ last_error            │                       │
+│  │ lidarr_checked_at     │                       │
 │  └───────────────────────┘                       │
 │                                                  │
 └──────────────────────────────────────────────────┘
@@ -77,13 +85,13 @@ CREATE TABLE local_library (
     title TEXT NOT NULL,
     recording_mbid TEXT,
     file_path TEXT,
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(artist, title, recording_mbid)
+    added_at TEXT NOT NULL
 );
 
-CREATE INDEX idx_local_lib_artist ON local_library(artist);
-CREATE INDEX idx_local_lib_artist_title ON local_library(artist, title);
-CREATE INDEX idx_local_lib_mbid ON local_library(recording_mbid);
+CREATE UNIQUE INDEX ux_local_library_natural
+    ON local_library(artist COLLATE NOCASE, title COLLATE NOCASE);
+CREATE INDEX idx_local_library_artist ON local_library(artist);
+CREATE INDEX idx_local_library_mbid ON local_library(recording_mbid);
 ```
 
 **Columns**:
@@ -93,22 +101,23 @@ CREATE INDEX idx_local_lib_mbid ON local_library(recording_mbid);
 - `title`: Track title
 - `recording_mbid`: MusicBrainz recording ID (nullable)
 - `file_path`: Full path to audio file (nullable)
-- `added_at`: Timestamp when track was added to cache
+- `added_at`: Timestamp when track was added to cache; a re-scan never rewrites it
 
 **Constraints**:
-- UNIQUE constraint on (artist, title, recording_mbid) prevents duplicates
+- The natural key is a UNIQUE index on `(artist COLLATE NOCASE, title COLLATE NOCASE)`. `recording_mbid` is an attribute, not part of the key: a NULL MBID made the old table-level constraint useless.
 - Null values allowed for album, recording_mbid, file_path
+- Writing an existing artist + title is an upsert: `file_path` is refreshed, `album`/`recording_mbid` are only filled in, and `added_at` is kept
 
 **Purpose**: Cache-first lookup to avoid repeated filesystem scans
 
 **Index Strategy**:
+- Unique natural-key index makes the artist + title write idempotent, and a re-scan of a moved file updates `file_path` instead of leaving the stale one
 - Fast lookup by artist name
-- Fast lookup by artist + title combination (most common)
 - Fast lookup by MusicBrainz ID (for alternative searches)
 
 ### tracked_tracks
 
-Tracks recommended tracks pending fallback download after 24-hour delay.
+Tracks recommended tracks and their fallback download state.
 
 ```sql
 CREATE TABLE tracked_tracks (
@@ -117,55 +126,64 @@ CREATE TABLE tracked_tracks (
     artist TEXT NOT NULL,
     title TEXT NOT NULL,
     source TEXT DEFAULT 'listenbrainz',
-    status TEXT DEFAULT 'PENDING',
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP,
-    UNIQUE(recording_mbid, artist, title)
+    status TEXT NOT NULL DEFAULT 'NEW',
+    added_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    next_retry_at TEXT,
+    last_error TEXT,
+    lidarr_checked_at TEXT
 );
 
-CREATE INDEX idx_tracked_status ON tracked_tracks(status);
-CREATE INDEX idx_tracked_added_at ON tracked_tracks(added_at);
-CREATE INDEX idx_tracked_status_added ON tracked_tracks(status, added_at);
+CREATE UNIQUE INDEX ux_tracked_natural
+    ON tracked_tracks(artist COLLATE NOCASE, title COLLATE NOCASE);
+CREATE INDEX ix_tracked_queue ON tracked_tracks(status, next_retry_at);
 ```
 
 **Columns**:
 - `id`: Primary key, auto-increment
-- `recording_mbid`: MusicBrainz recording ID (nullable, can be null initially)
+- `recording_mbid`: MusicBrainz recording ID (nullable; an attribute, not part of the key)
 - `artist`: Artist name
 - `title`: Track title
 - `source`: Source of recommendation (default: 'listenbrainz')
-- `status`: State (PENDING → COMPLETED)
-- `added_at`: Timestamp when track was added to tracking
-- `completed_at`: Timestamp when fallback completed
+- `status`: State machine value: `NEW`, `WAITING_LIDARR`, `QUEUED_FALLBACK`, `RUNNING`, `COMPLETED`, `FAILED`, `DEAD` (default: `NEW`)
+- `added_at`: Timestamp when track was added to tracking (never rewritten)
+- `updated_at`: Timestamp of the last status change
+- `attempts`: Download attempts so far (default: 0)
+- `last_attempt_at`: When the last attempt started (nullable)
+- `next_retry_at`: Earliest time the backoff allows another attempt (nullable)
+- `last_error`: The last failure, truncated to 500 characters (nullable)
+- `lidarr_checked_at`: When Lidarr was last consulted for this track (nullable)
 
 **Constraints**:
-- UNIQUE constraint on (recording_mbid, artist, title) prevents duplicates
+- The natural key is a UNIQUE index on `(artist COLLATE NOCASE, title COLLATE NOCASE)`; `recording_mbid` is an attribute, not part of the key
 
-**Purpose**: Implements 24-hour fallback queue
+**Purpose**: Implements the per-track fallback queue and its retry state
 
 **Index Strategy**:
-- Fast lookup by status (for pending queries)
-- Fast lookup by added_at (for age-based filtering)
-- Composite index on (status, added_at) for typical 24-hour query
+- Fast lookup of the fallback queue by status and the time it may run
+- The composite index on `(status, next_retry_at)` covers the queue query below
 
 ## Query Examples
 
-### Find pending tracks eligible for fallback (24 hours old)
+### Find tracks eligible for fallback (queue head, backoff elapsed)
 
 ```python
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
-threshold = (datetime.now() - timedelta(hours=24)).isoformat()
+now = datetime.now(timezone.utc).isoformat()
 
 query = """
-SELECT id, recording_mbid, artist, title, source, added_at
+SELECT id, recording_mbid, artist, title, source, added_at, attempts
 FROM tracked_tracks
-WHERE status = 'PENDING' 
-  AND added_at < ?
-ORDER BY added_at ASC
+WHERE status = 'QUEUED_FALLBACK'
+  AND COALESCE(next_retry_at, added_at) <= ?
+ORDER BY COALESCE(next_retry_at, added_at) ASC
+LIMIT ?
 """
 
-results = db.execute(query, (threshold,)).fetchall()
+results = db.execute(query, (now, 10)).fetchall()
 ```
 
 ### Check if track exists locally
@@ -216,7 +234,7 @@ GROUP BY status
 """
 
 stats = db.execute(query).fetchall()
-# [('PENDING', 45), ('COMPLETED', 120)]
+# [('NEW', 45), ('QUEUED_FALLBACK', 3), ('COMPLETED', 120)]
 ```
 
 ## Performance Considerations
@@ -225,17 +243,17 @@ stats = db.execute(query).fetchall()
 
 1. **Lookup by Artist (local_library)**:
    - Query: `WHERE artist = ?`
-   - Index: `idx_local_lib_artist`
+   - Index: `idx_local_library_artist`
    - Expected: O(log n)
 
 2. **Lookup by Artist + Title (local_library)**:
    - Query: `WHERE artist = ? AND title = ?`
-   - Index: `idx_local_lib_artist_title`
+   - Index: `ux_local_library_natural` (the natural-key unique index)
    - Expected: O(log n)
 
-3. **Pending Tracks Query (tracked_tracks)**:
-   - Query: `WHERE status = 'PENDING' AND added_at < ?`
-   - Index: `idx_tracked_status_added`
+3. **Fallback Queue Query (tracked_tracks)**:
+   - Query: `WHERE status = 'QUEUED_FALLBACK' AND COALESCE(next_retry_at, added_at) <= ?`
+   - Index: `ix_tracked_queue` (`status`, `next_retry_at`)
    - Expected: O(log n)
 
 ### Vacuum and Maintenance
