@@ -15,6 +15,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from .connection import DatabaseConnection, integrity_ok
 from .errors import DatabaseFileError
@@ -35,14 +36,15 @@ class RepairReport:
     What an explicit repair did, for the operator and for the log.
 
     Attributes:
-        backup_path: Where the pre-repair file was saved.
+        backup_path: Where the pre-repair file was saved, or ``None`` when there
+            was no file to save (a fresh install, not damage).
         tables: ``{table: rows}`` **of the old database**, counted in the backup,
             so the operator can see what the rebuild cost. Empty when the old
             file was too damaged to count.
         integrity_ok: Whether the *rebuilt* database passes its integrity check.
     """
 
-    backup_path: Path
+    backup_path: Optional[Path]
     tables: dict[str, int]
     integrity_ok: bool
 
@@ -159,6 +161,16 @@ def repair_database(db_path: Path) -> RepairReport:
             not be done. The original file survives every one of those.
     """
     db_path = Path(db_path)
+    if not db_path.exists():
+        # A missing file is a fresh install, not damage: there is nothing to back
+        # up and nothing to preserve. Create the schema and report honestly that
+        # no backup exists, rather than failing on a copy of a file that never was.
+        DatabaseConnection(db_path).initialize()
+        return RepairReport(
+            backup_path=None,
+            tables={},
+            integrity_ok=integrity_ok(db_path),
+        )
     backup_path = backup_database(db_path)
     # Counted before the old file is replaced, and from the backup, so the
     # numbers describe the file as it was backed up even if a later step fails.

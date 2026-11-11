@@ -54,13 +54,16 @@ def repair_database_mode(db_path: str) -> int:
         logger.error(str(e))
         return 1
 
-    logger.info(f"Old database backed up to {report.backup_path}")
+    if report.backup_path is None:
+        logger.info(f"No existing database at {db_path}; created a fresh one")
+    else:
+        logger.info(f"Old database backed up to {report.backup_path}")
     if not report.integrity_ok:
         logger.error(f"Rebuilt database at {db_path} failed its integrity check")
         return 1
     for table, rows in report.tables.items():
         logger.info(f"The old database had {rows} rows in {table}")
-    if not report.tables:
+    if not report.tables and report.backup_path is not None:
         logger.warning(
             f"Could not count the rows in the old database at {db_path}; "
             f"the backup at {report.backup_path} is the only copy of them"
@@ -230,9 +233,9 @@ Examples:
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default=Config.LOG_LEVEL,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)"
+        help=f"Logging level (default: {Config.LOG_LEVEL}, from LOG_LEVEL)"
     )
     parser.add_argument(
         "--interactive",

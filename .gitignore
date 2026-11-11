@@ -17,3 +17,4 @@ htmlcov/
 .review/
 .superpowers/
 *.egg-info/
+.testdata/

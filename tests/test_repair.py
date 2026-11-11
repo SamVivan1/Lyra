@@ -326,3 +326,24 @@ def test_a_failed_rebuild_leaves_the_original_database_and_names_the_backup(
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM local_library").fetchone()[0] == 2
     assert not list(tmp_path.glob("live.db.rebuild-*")), "no abandoned replacement"
+
+
+def test_repair_of_a_missing_database_creates_one(tmp_path):
+    """A fresh install is not damage: no backup, no failure, just a schema."""
+    db_path = tmp_path / "fresh.db"
+    assert not db_path.exists()
+
+    report = maintenance.repair_database(db_path)
+
+    assert report.backup_path is None, "there was no file to back up"
+    assert report.tables == {}
+    assert report.integrity_ok
+    assert db_path.exists()
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    assert {"artists", "local_library", "tracked_tracks"} <= tables
+    assert not list(tmp_path.glob("fresh.db.backup-*")), "nothing to back up"
+    assert main_module.repair_database_mode(str(db_path)) == 0

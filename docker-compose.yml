@@ -11,6 +11,8 @@ services:
       - .env
     # The package is installed in the image, so the console module is the entry point.
     command: ["python", "-m", "lyra", "--loop", "--interval", "3600"]
+    # Run unprivileged; keep the UID/GID aligned with the owner of ./data.
+    user: "${LYRA_UID:-1000}:${LYRA_GID:-1000}"
     volumes:
       - /mnt/Storage2/data/media/Music:/mnt/Storage2/data/media/Music
       - /mnt/Storage1/data/media/Music:/mnt/Storage1/data/media/Music

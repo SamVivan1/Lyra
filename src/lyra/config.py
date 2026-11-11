@@ -56,7 +56,10 @@ class Config:
             if sep != ",":
                 normalized = normalized.replace(sep, ",")
 
-        return [path.strip() for path in normalized.split(",") if path.strip()]
+        paths = [path.strip() for path in normalized.split(",") if path.strip()]
+        # dict.fromkeys keeps the configured order while dropping repeated roots:
+        # a copy-pasted LIBRARY_PATH otherwise scans and logs the same tree twice.
+        return list(dict.fromkeys(paths))
 
     @classmethod
     def library_paths(cls) -> list[str]:
