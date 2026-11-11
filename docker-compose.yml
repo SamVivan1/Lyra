@@ -9,14 +9,16 @@ services:
       - 1.1.1.1
     env_file:
       - .env
-    command: ["python", "main.py", "--loop", "--interval", "3600"]
+    # The package is installed in the image, so the console module is the entry point.
+    command: ["python", "-m", "lyra", "--loop", "--interval", "3600"]
     volumes:
       - /mnt/Storage2/data/media/Music:/mnt/Storage2/data/media/Music
+      - /mnt/Storage1/data/media/Music:/mnt/Storage1/data/media/Music
       - /DATA/Downloads:/DATA/Downloads
       # Mount the database directory so the SQLite state is persistent
       - ./data:/app/data
     environment:
       - DB_PATH=/app/data/music_automation.db
-      - TZ=Asia/Jakarta
+      - TZ=Asia/Jakarta # Change to your timezone if needed
       - MAX_ARTISTS_PER_RUN=10
       - FALLBACK_HOURS=6

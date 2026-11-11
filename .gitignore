@@ -1,9 +1,18 @@
 __pycache__/
 *.pyc
 .env
-data/
+.venv/
+.pytest_cache/
 *.db
 *.db-shm
 *.db-wal
+data/
+music_automation.log
 *.log
--1
+# Coverage tooling (pytest-cov) writes these on every run.
+.coverage
+.coverage.*
+htmlcov/
+# Agent review artifacts, never part of the package.
+.review/
+.superpowers/

@@ -22,6 +22,8 @@ This system is intended for a homelab environment and must be robust, modular, a
 
 * Music library:
   /mnt/Storage2/data/media/Music
+  /mnt/Storage1/data/media/Music
+
 
 * Download directory (used by torrent client):
   /DATA/Downloads
