@@ -25,14 +25,24 @@ class StateManager:
     - Coordinate database operations
     """
 
-    def __init__(self, db_connection: Optional[DatabaseConnection] = None) -> None:
+    def __init__(
+        self,
+        db_connection: Optional[DatabaseConnection] = None,
+        dry_run: bool = False
+    ) -> None:
         """
         Initialize StateManager.
-        
+
+        The dry-run flag lives here, on the object that owns the writes, so that
+        no caller can forget to check it: with ``dry_run`` set, every mutating
+        method reports success and writes nothing.
+
         Args:
             db_connection: DatabaseConnection instance. Creates new if None.
+            dry_run: If True, no write reaches the database
         """
         self.db = db_connection or DatabaseConnection()
+        self.dry_run = dry_run
 
     @staticmethod
     def _now_iso() -> str:
@@ -64,6 +74,10 @@ class StateManager:
         Returns:
             True if successfully added, False if already exists
         """
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Not adding local track '{artist} - {title}'")
+            return True
+
         try:
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
@@ -149,6 +163,10 @@ class StateManager:
         Returns:
             True if successfully cleared
         """
+        if self.dry_run:
+            logger.info("[DRY RUN] Not clearing the local_library cache")
+            return True
+
         try:
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
@@ -177,6 +195,10 @@ class StateManager:
         Returns:
             True if successfully added, False if already exists
         """
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Not adding artist '{artist_name}'")
+            return True
+
         try:
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
@@ -212,16 +234,25 @@ class StateManager:
     def ensure_library_indexed(self, force_rescan: bool = False) -> None:
         """
         Ensure library is indexed. Import LibraryScanner locally to avoid circular imports.
-        
+
+        The scanner builds its own StateManager, so the dry-run flag has to be
+        handed to it here: a scanner left to its own devices writes through a
+        store that was never told about the dry run, which is exactly how a
+        ``--rescan --dry-run`` used to fill local_library.
+
         Args:
             force_rescan: Force full rescan if True
         """
         from .library_scanner import LibraryScanner
         from ..config import Config
 
+        if self.dry_run:
+            logger.info("[DRY RUN] Library index will not be written")
+
         if force_rescan:
+            # A no-op in a dry run: the clear goes through this store.
             self.clear_local_library()
 
         for library_path in Config.library_paths():
-            scanner = LibraryScanner(library_path, self.db)
+            scanner = LibraryScanner(library_path, self.db, dry_run=self.dry_run)
             scanner.scan_library(force=False)

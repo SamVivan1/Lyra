@@ -103,18 +103,22 @@ class LibraryScanner:
     def __init__(
         self,
         library_path: str,
-        db_connection: Optional[DatabaseConnection] = None
+        db_connection: Optional[DatabaseConnection] = None,
+        dry_run: bool = False
     ) -> None:
         """
         Initialize LibraryScanner.
-        
+
         Args:
             library_path: Path to music library directory
             db_connection: DatabaseConnection instance. Creates new if None.
+            dry_run: If True, the scan reads the filesystem and writes no rows
         """
         self.library_path = Path(library_path)
         self.db = db_connection or DatabaseConnection()
-        self.state_manager = StateManager(self.db)
+        self.dry_run = dry_run
+        # The scanner writes through this store, so it must be told the flag.
+        self.state_manager = StateManager(self.db, dry_run=dry_run)
 
     def scan_library(self, force: bool = False) -> int:
         """
@@ -126,8 +130,12 @@ class LibraryScanner:
         Returns:
             Number of tracks added during this scan
         """
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Not indexing {self.library_path}")
+
         if force:
             logger.info("Force rescan requested - clearing local library cache")
+            # A no-op in a dry run: the clear goes through the store above.
             self.state_manager.clear_local_library()
 
         logger.info(f"Scanning music library at {self.library_path}")

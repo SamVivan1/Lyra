@@ -24,14 +24,20 @@ class TrackStateManager:
     - Retrieve pending tracks for fallback
     """
 
-    def __init__(self, db_connection: Optional[DatabaseConnection] = None) -> None:
+    def __init__(
+        self,
+        db_connection: Optional[DatabaseConnection] = None,
+        dry_run: bool = False
+    ) -> None:
         """
         Initialize TrackStateManager.
-        
+
         Args:
             db_connection: DatabaseConnection instance. Creates new if None.
+            dry_run: If True, no write reaches the database
         """
         self.db = db_connection or DatabaseConnection()
+        self.dry_run = dry_run
 
     @staticmethod
     def _now_iso() -> str:
@@ -65,6 +71,10 @@ class TrackStateManager:
         Returns:
             True if the row was inserted, False if the track was already tracked
         """
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Not tracking '{artist} - {title}'")
+            return True
+
         try:
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
@@ -167,6 +177,10 @@ class TrackStateManager:
         if not (track_id or recording_mbid or (artist and title)):
             logger.warning("mark_tracked_track_completed: No identifier provided")
             return False
+
+        if self.dry_run:
+            logger.info("[DRY RUN] Not marking the tracked track as completed")
+            return True
 
         try:
             with self.db.get_connection() as conn:

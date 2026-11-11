@@ -38,6 +38,21 @@ class FallbackOrchestrator:
         self.state_manager = state_manager or StateManager(db_connection)
         self.downloader = downloader or Downloader()
 
+    @property
+    def _store_dry_run(self) -> bool:
+        """
+        Whether the objects this orchestrator writes through are in dry-run mode.
+
+        The flag belongs to the store, so this only reports what those objects
+        already decided; the constructor has no flag of its own. ``is True`` and
+        not a plain truthiness test: a test double answers any attribute with a
+        truthy mock, and that must not turn a real run into a dry one.
+        """
+        return (
+            getattr(self.state_manager, "dry_run", False) is True
+            or getattr(self.downloader, "dry_run", False) is True
+        )
+
     def run_fallback(self, dry_run: bool = False) -> None:
         """
         Execute fallback download logic for pending tracks.
@@ -45,13 +60,20 @@ class FallbackOrchestrator:
         Args:
             dry_run: If True, don't perform actual downloads
         """
+        dry_run = dry_run or self._store_dry_run
+
         logger.info("Starting fallback check...")
 
         # Import TrackStateManager locally to avoid circular imports
         from ..database.track_manager import TrackStateManager
         from ..config import Config
 
-        track_manager = TrackStateManager(self.state_manager.db)
+        # The flag travels with the store: this manager is built for the run,
+        # and so is a dry state manager if the injected one is not one already.
+        track_manager = TrackStateManager(self.state_manager.db, dry_run=dry_run)
+        state_writes = self.state_manager
+        if dry_run and getattr(state_writes, "dry_run", False) is not True:
+            state_writes = StateManager(self.state_manager.db, dry_run=True)
         pending_tracks = track_manager.get_pending_tracked_tracks(hours=Config.FALLBACK_HOURS)
         if not pending_tracks:
             logger.info("No pending tracks eligible for fallback")
@@ -75,25 +97,22 @@ class FallbackOrchestrator:
                     f"Track '{artist} - {title}' is available locally. "
                     "Marking as completed."
                 )
-                if not dry_run:
-                    track_manager.mark_tracked_track_completed(track_id=track_id)
+                track_manager.mark_tracked_track_completed(track_id=track_id)
                 continue
 
             logger.info(f"Triggering fallback download for '{artist} - {title}'")
 
-            if dry_run:
-                logger.info(f"[DRY RUN] Would download: '{artist} - {title}'")
-                continue
-
-            # Attempt download
-            success = self.downloader.download_track(artist, title, dry_run=False)
+            # One path for both modes: the dry-run flag reaches the downloader,
+            # whose own store decides whether the file is written, and the
+            # manager above decides whether the row is completed.
+            success = self.downloader.download_track(artist, title, dry_run=dry_run)
             if success:
                 # Add to local library
-                self.state_manager.add_local_track(
+                state_writes.add_local_track(
                     artist,
                     title,
                     recording_mbid=recording_mbid,
-                    added_at=self.state_manager._now_iso()
+                    added_at=state_writes._now_iso()
                 )
                 track_manager.mark_tracked_track_completed(track_id=track_id)
                 logger.info(f"Fallback completed for '{artist} - {title}'")

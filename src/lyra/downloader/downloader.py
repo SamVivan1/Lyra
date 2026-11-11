@@ -30,15 +30,19 @@ class Downloader:
     - Library organization
     """
 
-    def __init__(self, library_path: Optional[str] = None):
+    def __init__(self, library_path: Optional[str] = None, dry_run: bool = False):
         """
         Initialize Downloader.
-        
+
         Args:
             library_path: Path to music library (default: Config.LIBRARY_PATH)
+            dry_run: If True, nothing is downloaded, tagged or written; the
+                read-only yt-dlp calls still work so a simulation can reach the
+                screen that offers the download
         """
         self.library_path = Path(library_path or self._resolve_library_root())
         self.metadata_handler = MetadataHandler()
+        self.dry_run = dry_run
         self.last_downloaded_path: Optional[str] = None
 
     def _resolve_library_root(self) -> str:
@@ -78,11 +82,13 @@ class Downloader:
         Args:
             artist: Artist name
             track: Track name
-            dry_run: If True, don't actually download
+            dry_run: If True, don't actually download (or-ed with the store flag)
             
         Returns:
             True if successfully downloaded or already exists
         """
+        dry_run = dry_run or self.dry_run
+
         if self._track_exists(artist, track):
             logger.info(f"Track '{artist} - {track}' already exists. Skipping.")
             return True
@@ -92,7 +98,7 @@ class Downloader:
             return True
 
         query = f"ytsearch1:{artist} {track} official audio"
-        return self.download_manual(query, artist, track)
+        return self.download_manual(query, artist, track, dry_run=dry_run)
 
     def _get_yt_dlp_base_cmd(self) -> List[str]:
         """
@@ -195,11 +201,13 @@ class Downloader:
             year: Release year (optional)
             release_date: Full release date (optional)
             track_number: Track number in album (optional)
-            dry_run: If True, don't actually download
+            dry_run: If True, don't actually download (or-ed with the store flag)
             
         Returns:
             True if successful, False otherwise
         """
+        dry_run = dry_run or self.dry_run
+
         if self._track_exists(artist, title):
             logger.info(f"Track '{artist} - {title}' already exists. Skipping.")
             return True

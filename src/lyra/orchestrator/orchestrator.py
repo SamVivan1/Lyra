@@ -31,22 +31,47 @@ class ApplicationOrchestrator:
     def __init__(
         self,
         db_connection: Optional[DatabaseConnection] = None,
-        state_manager: Optional[StateManager] = None
+        state_manager: Optional[StateManager] = None,
+        dry_run: bool = False
     ):
         """
         Initialize ApplicationOrchestrator.
-        
+
+        The dry-run flag is handed to every store this orchestrator writes
+        through, so the decision is made once here instead of at each call site.
+
         Args:
             db_connection: DatabaseConnection instance
             state_manager: StateManager instance
+            dry_run: If True, no row is written and no artist is posted to Lidarr
         """
         self.db = db_connection or DatabaseConnection()
-        self.state_manager = state_manager or StateManager(self.db)
-        
+        self.dry_run = dry_run or (getattr(state_manager, "dry_run", False) is True)
+        self.state_manager = state_manager or StateManager(self.db, dry_run=self.dry_run)
+
         self.lb_client = ListenBrainzClient()
         self.lidarr_client = LidarrClient()
-        self.track_manager = TrackStateManager(self.db)
+        self.track_manager = TrackStateManager(self.db, dry_run=self.dry_run)
         self.fallback_orchestrator = FallbackOrchestrator(self.state_manager)
+
+    def _add_artist_to_lidarr(self, artist: str, dry_run: bool) -> bool:
+        """
+        Add one artist to Lidarr, or report the add a dry run would make.
+
+        A dry run must not reach Lidarr: adding an artist is a POST to a system
+        outside this one, and no later step can undo it.
+
+        Args:
+            artist: Artist name
+            dry_run: If True, log the intended add and stop
+
+        Returns:
+            True if the artist was added, or would have been
+        """
+        if dry_run:
+            logger.info(f"[DRY RUN] would add '{artist}' to Lidarr")
+            return True
+        return bool(self.lidarr_client.add_artist(artist))
 
     def add_artists_from_recommendations(
         self,
@@ -55,14 +80,31 @@ class ApplicationOrchestrator:
     ) -> int:
         """
         Add recommended artists to Lidarr and track their recommended tracks.
-        
+
+        One code path serves both modes. The write-capable objects decide what
+        happens to a write, so the only thing the dry run changes here is the
+        POST to Lidarr, which no store can intercept.
+
         Args:
             limit: Maximum number of artists to add per run
-            dry_run: If True, don't perform actual operations
+            dry_run: If True, don't perform actual operations (or-ed with the
+                orchestrator's own flag)
             
         Returns:
             Number of artists successfully added
         """
+        dry_run = dry_run or self.dry_run
+
+        # The flag belongs to the store that writes, so a call-level flag has to
+        # reach one before the first write. The orchestrator's own managers are
+        # reused when they already agree, so an injected manager stays in charge.
+        state_writes = self.state_manager
+        track_writes = self.track_manager
+        if dry_run and getattr(state_writes, "dry_run", False) is not True:
+            state_writes = StateManager(self.db, dry_run=True)
+        if dry_run and getattr(track_writes, "dry_run", False) is not True:
+            track_writes = TrackStateManager(self.db, dry_run=True)
+
         logger.info("Starting artist addition from ListenBrainz recommendations...")
         
         try:
@@ -96,17 +138,9 @@ class ApplicationOrchestrator:
                 logger.debug(f"Artist '{artist}' already tracked")
             else:
                 logger.info(f"Adding new artist: {artist}")
-                if dry_run:
-                    logger.info(
-                        f"[DRY RUN] Would add '{artist}' to Lidarr "
-                        f"with {len(tracks)} tracks"
-                    )
+                if self._add_artist_to_lidarr(artist, dry_run):
+                    state_writes.add_artist(artist, recommended_tracks=tracks)
                     added_count += 1
-                else:
-                    success = self.lidarr_client.add_artist(artist)
-                    if success:
-                        self.state_manager.add_artist(artist, recommended_tracks=tracks)
-                        added_count += 1
 
             # Track recommended tracks for fallback
             for track in tracks:
@@ -115,8 +149,8 @@ class ApplicationOrchestrator:
                         f"Track '{artist} - {track}' already exists locally"
                     )
                     continue
-                
-                self.track_manager.add_tracked_track(
+
+                track_writes.add_tracked_track(
                     None,
                     artist,
                     track,
@@ -136,7 +170,7 @@ class ApplicationOrchestrator:
         Args:
             dry_run: If True, don't perform actual downloads
         """
-        self.fallback_orchestrator.run_fallback(dry_run=dry_run)
+        self.fallback_orchestrator.run_fallback(dry_run=dry_run or self.dry_run)
 
     def ensure_library_indexed(self, force_rescan: bool = False) -> None:
         """

@@ -218,7 +218,9 @@ Examples:
         # unwritable path, or the busy database. Reporting only: never repair.
         logger.error(_startup_error_message(e, Config.DB_PATH))
         return 1
-    orchestrator = ApplicationOrchestrator(db_connection)
+    # The dry-run flag is a property of the stores the orchestrator builds, so
+    # it is handed over once here: every write path below then inherits it.
+    orchestrator = ApplicationOrchestrator(db_connection, dry_run=args.dry_run)
 
     # Ensure library is indexed
     logger.info("Ensuring music library is indexed...")
