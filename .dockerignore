@@ -1,0 +1,17 @@
+# What the Docker daemon must never send into a build context.
+# The image is built from the repository root, so everything here is an
+# exclusion from a context that would otherwise contain real credentials.
+.env
+.env.*
+.venv/
+.git/
+data/
+*.db
+*.log
+cookies.txt
+.pytest_cache/
+__pycache__/
+*.pyc
+.review/
+.superpowers/
+docs/superpowers/
