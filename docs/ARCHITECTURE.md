@@ -104,36 +104,47 @@ src/lyra/
 ```sql
 -- Artists tracked for recommendations
 CREATE TABLE artists (
-    id INTEGER PRIMARY KEY,
-    name TEXT UNIQUE NOT NULL,
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_checked TIMESTAMP
+    artist_name TEXT PRIMARY KEY,
+    added_at TEXT NOT NULL,
+    recommended_tracks TEXT
 );
 
 -- Local library cache (filesystem scanned tracks)
 CREATE TABLE local_library (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     artist TEXT NOT NULL,
     album TEXT,
     title TEXT NOT NULL,
     recording_mbid TEXT,
     file_path TEXT,
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(artist, title, recording_mbid)
+    added_at TEXT NOT NULL
 );
+CREATE UNIQUE INDEX ux_local_library_natural
+    ON local_library(artist COLLATE NOCASE, title COLLATE NOCASE);
+CREATE INDEX idx_local_library_artist ON local_library(artist);
+CREATE INDEX idx_local_library_mbid ON local_library(recording_mbid);
 
--- Recommended tracks pending fallback download (24-hour timer)
+-- Recommended tracks pending fallback download (24-hour timer).
+-- status is the retry state machine's state; NEW is the queue head, and the
+-- default is NEW so an INSERT that names no status is still read by the queue.
 CREATE TABLE tracked_tracks (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     recording_mbid TEXT,
     artist TEXT NOT NULL,
     title TEXT NOT NULL,
     source TEXT DEFAULT 'listenbrainz',
-    status TEXT DEFAULT 'PENDING',
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP,
-    UNIQUE(recording_mbid, artist, title)
+    status TEXT NOT NULL DEFAULT 'NEW',
+    added_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    next_retry_at TEXT,
+    last_error TEXT,
+    lidarr_checked_at TEXT
 );
+CREATE UNIQUE INDEX ux_tracked_natural
+    ON tracked_tracks(artist COLLATE NOCASE, title COLLATE NOCASE);
+CREATE INDEX ix_tracked_queue ON tracked_tracks(status, next_retry_at);
 ```
 
 **StateManager** (`state.py`):
@@ -145,7 +156,7 @@ CREATE TABLE tracked_tracks (
 - Manages tracked_tracks table
 - Adds pending tracks for fallback
 - Retrieves tracks overdue for fallback (24-hour threshold)
-- Marks completion by track_id or MBID
+- Marks completion by track_id, then artist + title, then MBID
 
 **LibraryScanner** (`library_scanner.py`):
 - Filesystem scanning for audio files
@@ -253,7 +264,7 @@ CREATE TABLE tracked_tracks (
    └─ StateManager.add_artist() → artists table
    ↓
 3. Track recommended tracks
-   └─ TrackStateManager.add_tracked_track() → tracked_tracks (PENDING)
+   └─ TrackStateManager.add_tracked_track() → tracked_tracks (NEW)
 ```
 
 ### Workflow 2: 24-Hour Fallback Polling
@@ -262,7 +273,7 @@ CREATE TABLE tracked_tracks (
 1. ApplicationOrchestrator.run_fallback()
    ↓
 2. TrackStateManager.get_pending_tracked_tracks()
-   └─ SELECT * FROM tracked_tracks WHERE status='PENDING' AND added_at < NOW-24h
+   └─ SELECT * FROM tracked_tracks WHERE status='NEW' AND added_at < NOW-24h
    ↓
 3. For each pending track:
    ├─ StateManager.track_exists() → check local_library

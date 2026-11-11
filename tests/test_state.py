@@ -160,3 +160,59 @@ def test_a_shared_mbid_does_not_make_two_tracks_the_same(tmp_path):
     assert tm.add_tracked_track("mbid-1", "A", "Other Title") is True
     with conn.get_connection() as c:
         assert c.execute("SELECT COUNT(*) FROM tracked_tracks").fetchone()[0] == 2
+
+
+def test_completion_by_artist_and_title_leaves_a_shared_mbid_alone(tmp_path):
+    """Two rows may share one MBID (ruling 9), so completion must not key on it.
+
+    The caller supplies artist + title as well; the natural key is the precise
+    identifier and the shared MBID must not drag the other row to COMPLETED.
+    """
+    conn = DatabaseConnection(tmp_path / "t.db")
+    conn.initialize()
+    tm = TrackStateManager(conn)
+    assert tm.add_tracked_track("mbid-1", "A", "B") is True
+    assert tm.add_tracked_track("mbid-1", "A", "Other Title") is True
+
+    assert tm.mark_tracked_track_completed(
+        recording_mbid="mbid-1", artist="A", title="B"
+    ) is True
+
+    with conn.get_connection() as c:
+        statuses = dict(
+            c.execute("SELECT title, status FROM tracked_tracks").fetchall()
+        )
+    assert statuses == {"B": "COMPLETED", "Other Title": "NEW"}
+
+
+def test_completion_by_mbid_alone_still_works(tmp_path):
+    """Without artist + title the MBID stays the fallback, and the method's
+    public signature still accepts it."""
+    conn = DatabaseConnection(tmp_path / "t.db")
+    conn.initialize()
+    tm = TrackStateManager(conn)
+    assert tm.add_tracked_track("mbid-1", "A", "B") is True
+
+    assert tm.mark_tracked_track_completed(recording_mbid="mbid-1") is True
+    with conn.get_connection() as c:
+        assert c.execute("SELECT status FROM tracked_tracks").fetchone()[0] == "COMPLETED"
+
+
+def test_an_insert_that_omits_status_is_visible_to_the_queue(tmp_path):
+    """The default status must be one this query reads.
+
+    v1's ``DEFAULT 'PENDING'`` would make a status-less INSERT a row the fallback
+    queue never returns -- a silently invisible track. This is the end-to-end form
+    of the schema assertion in ``test_migrations.py``.
+    """
+    conn = DatabaseConnection(tmp_path / "t.db")
+    conn.initialize()
+    tm = TrackStateManager(conn)
+    with conn.get_connection() as c:
+        c.execute(
+            "INSERT INTO tracked_tracks (artist,title,added_at,updated_at)"
+            " VALUES ('A','B','2000-01-01T00:00:00+00:00','2000-01-01T00:00:00+00:00')"
+        )
+        c.commit()
+
+    assert [t["title"] for t in tm.get_pending_tracked_tracks(hours=0)] == ["B"]

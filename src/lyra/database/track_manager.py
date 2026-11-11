@@ -147,12 +147,19 @@ class TrackStateManager:
     ) -> bool:
         """
         Mark a tracked track as completed.
-        
+
+        The identifiers are tried in this order, and the natural key comes before
+        the MBID on purpose: two rows may legitimately share one ``recording_mbid``
+        (the unique index is on artist + title, and an MBID is an attribute), so a
+        caller that supplies artist + title must not have the other row completed
+        as well. The MBID is the fallback for the callers that have nothing else.
+
         Args:
             track_id: Primary key ID (prioritized)
-            recording_mbid: MusicBrainz recording ID (second priority)
-            artist: Artist name (third priority, requires title)
-            title: Track title (third priority, requires artist)
+            artist: Artist name (second priority, requires title)
+            title: Track title (second priority, requires artist)
+            recording_mbid: MusicBrainz recording ID (third priority: it can be
+                shared by several tracked tracks)
             
         Returns:
             True if successfully updated, False otherwise
@@ -172,18 +179,18 @@ class TrackStateManager:
                         SET status = "COMPLETED", updated_at = ? 
                         WHERE id = ?
                     ''', (now, track_id))
-                elif recording_mbid:
-                    cursor.execute('''
-                        UPDATE tracked_tracks 
-                        SET status = "COMPLETED", updated_at = ? 
-                        WHERE recording_mbid = ?
-                    ''', (now, recording_mbid))
-                else:
+                elif artist and title:
                     cursor.execute('''
                         UPDATE tracked_tracks 
                         SET status = "COMPLETED", updated_at = ? 
                         WHERE artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE
                     ''', (now, artist, title))
+                else:
+                    cursor.execute('''
+                        UPDATE tracked_tracks 
+                        SET status = "COMPLETED", updated_at = ? 
+                        WHERE recording_mbid = ?
+                    ''', (now, recording_mbid))
                 
                 conn.commit()
                 affected = cursor.rowcount

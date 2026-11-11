@@ -905,3 +905,98 @@ def test_each_migration_writes_its_own_report(tmp_path):
     assert (tmp_path / "migration-duplicates-2.txt").read_text(
         encoding="utf-8"
     ).splitlines() == ["1\tArtist\tSong"]
+
+
+def test_an_insert_that_omits_status_lands_as_new(tmp_path):
+    """No writer may inherit the legacy ``'PENDING'`` default.
+
+    A row inserted without naming a status must be one the queue reads. The v1
+    DDL's ``DEFAULT 'PENDING'`` would make it a row nothing looks at -- a
+    silently invisible track -- so v2 rebuilds the table without it.
+    """
+    db = tmp_path / "t.db"
+    DatabaseConnection(db).initialize()
+
+    c = sqlite3.connect(db)
+    try:
+        c.execute(
+            "INSERT INTO tracked_tracks (artist,title,added_at,updated_at)"
+            " VALUES ('A','B',?,?)",
+            (NOW, NOW),
+        )
+        c.commit()
+        assert c.execute("SELECT status FROM tracked_tracks").fetchone()[0] == "NEW"
+        status = {
+            row[1]: row for row in c.execute("PRAGMA table_info(tracked_tracks)")
+        }["status"]
+        assert status[3] == 1, "status must be NOT NULL"
+        assert status[4] == "'NEW'", "status must default to the queue head"
+    finally:
+        c.close()
+
+
+def test_v1_tracked_tracks_rows_and_ids_survive_the_rebuild(tmp_path):
+    """The rebuild copies rows with their ids, and drops the legacy constraint.
+
+    The duplicate report names rows by id, so an id must keep naming the same
+    track. The gap left by an earlier delete stays a gap rather than being
+    renumbered. The table-level ``UNIQUE(recording_mbid, artist, title)`` that
+    v1 released cannot be dropped in place, so the rebuild is what removes it.
+    """
+    db = _track(
+        _v1_db(tmp_path),
+        [
+            ("A", "B", "PENDING", None),
+            ("Deleted", "Before Migrating", "NEW", None),
+            ("C", "D", "COMPLETED", "mbid-2"),
+        ],
+    )
+    c = sqlite3.connect(db)
+    c.execute("DELETE FROM tracked_tracks WHERE id = 2")
+    c.commit()
+    c.close()
+
+    DatabaseConnection(db).initialize()
+
+    assert _tracked_rows(db) == [
+        (1, None, "A", "B", "NEW", 0, None),
+        (3, "mbid-2", "C", "D", "COMPLETED", 0, None),
+    ]
+    indexes = _index_names(db, "tracked_tracks")
+    assert not any(name.startswith("sqlite_autoindex_") for name in indexes), (
+        "the legacy UNIQUE(recording_mbid, artist, title) must not survive the rebuild"
+    )
+    assert "idx_tracked_tracks_status" not in indexes, (
+        "ix_tracked_queue's prefix covers it"
+    )
+    assert {"ux_tracked_natural", "ix_tracked_queue"} <= indexes
+
+
+def _index_names(db, table):
+    c = sqlite3.connect(db)
+    try:
+        return {str(row[1]) for row in c.execute(f"PRAGMA index_list({table})")}
+    finally:
+        c.close()
+
+
+def test_a_legacy_row_without_a_status_is_queued_as_new(tmp_path):
+    """``status`` was nullable in v1; the NOT NULL rebuild must not crash on it.
+
+    Such a row is invisible to every reader, which is the failure this iteration
+    removes, so the rebuild parks it on the queue head instead of failing the
+    whole migration on an integrity error.
+    """
+    db = _track(_v1_db(tmp_path), [("A", "B", "PENDING", None)])
+    c = sqlite3.connect(db)
+    c.execute(
+        "INSERT INTO tracked_tracks (artist,title,status,added_at,updated_at)"
+        " VALUES ('C','D',NULL,?,?)",
+        (NOW, NOW),
+    )
+    c.commit()
+    c.close()
+
+    DatabaseConnection(db).initialize()
+
+    assert [row[4] for row in _tracked_rows(db)] == ["NEW", "NEW"]

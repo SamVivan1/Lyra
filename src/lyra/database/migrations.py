@@ -37,10 +37,14 @@ semantics (ASCII-only case folding) applied explicitly.
 Migration v2 gives ``tracked_tracks`` the columns the retry state machine needs
 (``attempts``, ``last_attempt_at``, ``next_retry_at``, ``last_error``,
 ``lidarr_checked_at``), renames the legacy ``PENDING`` status to ``NEW``, merges
-the rows that share the natural key, and puts the unique index on that key. It
-also rebuilds ``artists`` without ``fallback_done``: no code in this branch ever
-set it, and ``ALTER TABLE ... DROP COLUMN`` would need a newer SQLite than the
-oldest interpreter in the CI matrix ships.
+the rows that share the natural key, and puts the unique index on that key. The
+table is rebuilt rather than altered, because two things v1 released must not
+outlive it: ``status DEFAULT 'PENDING'`` (a row inserted without a status would
+land on a value nothing reads) and the table-level
+``UNIQUE(recording_mbid, artist, title)``. It also rebuilds ``artists`` without
+``fallback_done``: no code in this branch ever set it, and
+``ALTER TABLE ... DROP COLUMN`` would need a newer SQLite than the oldest
+interpreter in the CI matrix ships.
 """
 
 import logging
@@ -94,10 +98,10 @@ _ARTISTS_DDL = """
     )
 """
 
-#: The v1 table, kept exactly as v1 released it: v2 adds its columns to this
-#: shape instead of editing it. The ``status`` default is the legacy queue head
-#: and is only reachable by an INSERT that names no status -- every writer in
-#: this branch names ``NEW`` explicitly.
+#: The v1 table, kept exactly as v1 released it: v2 rebuilds it instead of
+#: editing this definition. The ``status`` default is the legacy queue head, and
+#: once v2 has run no reader recognises it any more -- which is why v2 rebuilds
+#: the table rather than leaving the default in place.
 _TRACKED_TRACKS_DDL = """
     CREATE TABLE IF NOT EXISTS tracked_tracks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,19 +129,42 @@ _TRACKED_TRACKS_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_tracked_tracks_status ON tracked_tracks(status)",
 )
 
-#: The v2 state-machine columns of ``tracked_tracks``, as ``(name, definition)``.
-#: Every one is nullable or defaulted: a NOT NULL column cannot be added without
-#: a default, and a legacy row genuinely has no attempt history to carry. Those
-#: defaults *are* the reset a migrated row needs -- ``attempts`` 0 because no
-#: attempt was ever counted, ``next_retry_at`` NULL because no retry has been
-#: scheduled yet.
+#: The v2 state-machine columns of ``tracked_tracks``, by name. Used to tell an
+#: already rebuilt table from a v1 one, so a re-run cannot copy only the legacy
+#: columns and discard retry history.
 _TRACKED_TRACK_STATE_COLUMNS = (
-    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
-    ("last_attempt_at", "TEXT"),
-    ("next_retry_at", "TEXT"),
-    ("last_error", "TEXT"),
-    ("lidarr_checked_at", "TEXT"),
+    "attempts",
+    "last_attempt_at",
+    "next_retry_at",
+    "last_error",
+    "lidarr_checked_at",
 )
+
+#: The v2 table. ``status`` is ``NOT NULL DEFAULT 'NEW'`` so that an INSERT which
+#: names no status lands on the queue head the state machine reads -- the v1
+#: ``'PENDING'`` default would create a row nothing looks at. No table-level
+#: ``UNIQUE``: the natural-key index below is the only key, and the v1 constraint
+#: (weaker than it, and the reason NULL-MBID duplicates were possible) goes with
+#: the old table. The retry columns keep the reset a migrated row needs:
+#: ``attempts`` 0 because no attempt was ever counted, ``next_retry_at`` NULL
+#: because no retry has been scheduled yet.
+_TRACKED_TRACKS_V2_DDL = """
+    CREATE TABLE {table} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recording_mbid TEXT,
+        artist TEXT NOT NULL,
+        title TEXT NOT NULL,
+        source TEXT DEFAULT 'listenbrainz',
+        status TEXT NOT NULL DEFAULT 'NEW',
+        added_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT,
+        next_retry_at TEXT,
+        last_error TEXT,
+        lidarr_checked_at TEXT
+    )
+"""
 
 #: The v2 indexes: the natural key (which makes the insert idempotent) and the
 #: queue lookup the retry worker reads with ``ORDER BY next_retry_at``.
@@ -320,20 +347,22 @@ def _migrate_v1(conn: sqlite3.Connection, db_path: Path) -> List[str]:
 
 def _migrate_v2(conn: sqlite3.Connection, db_path: Path) -> List[str]:
     """
-    Give ``tracked_tracks`` the state-machine columns, then merge its duplicates.
+    Rebuild ``tracked_tracks`` in its v2 shape, then merge its duplicates.
 
     Order matters in both directions: the legacy status is renamed *before* the
     merge, because the merge ranks rows by status and ``PENDING`` is the old name
     of the queue head; and the unique index is created *after* it, because the
-    merge is what makes the index creatable.
+    merge is what makes the index creatable. The rebuild comes first because it
+    is what gives the rows the ``attempts`` column the merge reads.
 
-    The columns are added with ``ALTER TABLE ... ADD COLUMN`` rather than by
-    rebuilding the table: the table-level ``UNIQUE(recording_mbid, artist, title)``
-    that v1 left behind keeps working, and the natural-key index makes the insert
-    idempotent on its own. The column defaults are the reset a migrated row
-    needs: no attempt has ever been counted ("attempts = 0") and no retry has
-    been scheduled ("next_retry_at = NULL"), which is true by construction
-    because neither column existed before this migration.
+    The table is rebuilt rather than altered, the way v1 rebuilds
+    ``local_library``: two things v1 released cannot be dropped in place on the
+    oldest SQLite this project supports, and neither may outlive v2. The
+    ``status DEFAULT 'PENDING'`` would let an INSERT that names no status create
+    a row nothing reads, and ``UNIQUE(recording_mbid, artist, title)`` is
+    strictly weaker than the natural key (which is why NULL-MBID duplicates were
+    possible). Row ids are copied, not reassigned, so a duplicate report still
+    names the rows it dropped.
 
     Args:
         conn: Connection with an open write transaction.
@@ -345,8 +374,7 @@ def _migrate_v2(conn: sqlite3.Connection, db_path: Path) -> List[str]:
     """
     conn.execute("UPDATE tracked_tracks SET status = 'NEW' WHERE status = 'PENDING'")
 
-    for name, definition in _TRACKED_TRACK_STATE_COLUMNS:
-        conn.execute(f"ALTER TABLE tracked_tracks ADD COLUMN {name} {definition}")
+    _rebuild_tracked_tracks(conn)
 
     dropped = _merge_tracked_tracks(conn)
 
@@ -357,6 +385,48 @@ def _migrate_v2(conn: sqlite3.Connection, db_path: Path) -> List[str]:
 
     _set_user_version(conn, 2)
     return dropped
+
+
+def _rebuild_tracked_tracks(conn: sqlite3.Connection) -> None:
+    """
+    Recreate ``tracked_tracks`` in its v2 shape, keeping every row and its id.
+
+    ``ALTER TABLE ... DROP COLUMN`` needs SQLite 3.35 or newer and a table level
+    ``UNIQUE`` cannot be dropped at all, so the two v1 leftovers are removed the
+    way v1 removes a constraint: create the new table, copy the rows, drop the
+    old one, rename.
+
+    The ids are copied explicitly, because the duplicate report names rows by id
+    and a renumbered row would make that report lie. Every row is copied before
+    the merge runs, and the merge only deletes rows, so a duplicate's id is
+    never handed out again to a later insert.
+
+    A status of NULL was representable in v1 and is invisible to every reader;
+    it becomes ``NEW`` rather than failing the migration on the ``NOT NULL``
+    constraint of the rebuilt column.
+
+    Args:
+        conn: Connection with an open write transaction.
+    """
+    if not _table_exists(conn, "tracked_tracks"):
+        conn.execute(_TRACKED_TRACKS_V2_DDL.format(table="tracked_tracks"))
+        return
+    # Covered by ix_tracked_queue's prefix, and v1's copy went with the dropped
+    # table anyway. Dropping it by name also keeps a step re-run honest.
+    conn.execute("DROP INDEX IF EXISTS idx_tracked_tracks_status")
+    if _tracked_tracks_is_v2(conn):
+        logger.debug("tracked_tracks is already in its v2 shape")
+        return
+    conn.execute("DROP TABLE IF EXISTS tracked_tracks_v2")
+    conn.execute(_TRACKED_TRACKS_V2_DDL.format(table="tracked_tracks_v2"))
+    conn.execute(
+        "INSERT INTO tracked_tracks_v2 (id, recording_mbid, artist, title, source,"
+        " status, added_at, updated_at)"
+        " SELECT id, recording_mbid, artist, title, source, COALESCE(status, 'NEW'),"
+        " added_at, updated_at FROM tracked_tracks"
+    )
+    conn.execute("DROP TABLE tracked_tracks")
+    conn.execute("ALTER TABLE tracked_tracks_v2 RENAME TO tracked_tracks")
 
 
 def _merge_tracked_tracks(conn: sqlite3.Connection) -> List[str]:
@@ -692,6 +762,24 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     """Return the column names of ``table``."""
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _tracked_tracks_is_v2(conn: sqlite3.Connection) -> bool:
+    """
+    Return True when ``tracked_tracks`` already has the v2 shape.
+
+    Two things are checked, for the same reason as in :func:`_local_library_is_v1`:
+    every state column exists, and the table carries no table-level ``UNIQUE``
+    constraint (an ``sqlite_autoindex_`` entry in SQLite's terms). This guard is
+    what makes a re-run safe: rebuilding a table whose state columns are already
+    in use would copy only the legacy columns and silently discard retry history.
+    """
+    if not set(_TRACKED_TRACK_STATE_COLUMNS) <= _column_names(conn, "tracked_tracks"):
+        return False
+    return not any(
+        str(row[1]).startswith("sqlite_autoindex_")
+        for row in conn.execute("PRAGMA index_list(tracked_tracks)").fetchall()
+    )
 
 
 def _local_library_is_v1(conn: sqlite3.Connection) -> bool:
