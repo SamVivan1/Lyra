@@ -12,9 +12,7 @@ import tty
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    import questionary  # noqa: F401  # imported as an availability probe
     from rich.console import Console
-    from rich.panel import Panel  # noqa: F401  # imported as an availability probe
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False

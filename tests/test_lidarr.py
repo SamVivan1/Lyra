@@ -42,3 +42,10 @@ def test_add_artist_payload(mock_post, mock_get):
     assert payload["monitored"] is True
     assert payload["addOptions"]["monitor"] == "all"
     assert payload["addOptions"]["searchForMissingAlbums"] is True
+
+
+def test_api_key_header_is_empty_string_when_key_unset(monkeypatch):
+    """An unset key must send ``""``, not ``None`` (which ``requests`` rejects)."""
+    monkeypatch.setattr(Config, "LIDARR_API_KEY", None)
+    client = LidarrClient(url="http://mock-lidarr:8686", api_key=None)
+    assert client.headers["X-Api-Key"] == ""

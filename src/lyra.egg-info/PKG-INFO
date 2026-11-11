@@ -15,9 +15,6 @@ Requires-Dist: mutagen>=1.47.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0.0; extra == "dev"
 Requires-Dist: pytest-mock>=3.0.0; extra == "dev"
-Requires-Dist: pytest-cov>=5.0.0; extra == "dev"
-Requires-Dist: ruff>=0.6.0; extra == "dev"
-Requires-Dist: mypy>=1.10.0; extra == "dev"
 
 # Lyra: Self-Hosted Music Automation System 🎵
 
