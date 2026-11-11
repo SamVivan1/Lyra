@@ -13,16 +13,51 @@ from pathlib import Path
 from .config import Config
 from .logging_config import setup_logger, configure_root_logger
 from .database.connection import DatabaseConnection
+from .database.errors import DatabaseCorruptError, DatabaseFileError
 from .database.library_scanner import LibraryScanner
+from .database.maintenance import repair_database
 from .orchestrator import ApplicationOrchestrator
 
-logger = logging.getLogger(__name__)
+# Named explicitly rather than with ``__name__``: ``python -m lyra.main`` runs
+# this module as ``__main__``, whose logger has no handler, so the operator would
+# see none of the messages below -- including the repair summary.
+logger = logging.getLogger("lyra.main")
 
 
 def setup_logging(log_level: str = "INFO") -> None:
     """Setup logging for the application."""
     configure_root_logger(getattr(logging, log_level))
     setup_logger("lyra", level=getattr(logging, log_level))
+
+
+def repair_database_mode(db_path: str) -> int:
+    """
+    Back up and rebuild the database file, returning the process exit code.
+
+    Kept separate from :func:`main` so the repair path can be exercised without
+    a configured environment, and so ``--repair-db`` provably returns before any
+    other mode runs.
+
+    Args:
+        db_path: Path of the database file to repair.
+
+    Returns:
+        0 when the rebuilt database passes its integrity check, 1 otherwise.
+    """
+    try:
+        report = repair_database(Path(db_path))
+    except (DatabaseCorruptError, DatabaseFileError) as e:
+        logger.error(str(e))
+        return 1
+
+    logger.info(f"Old database backed up to {report.backup_path}")
+    if not report.integrity_ok:
+        logger.error(f"Rebuilt database at {db_path} failed its integrity check")
+        return 1
+    for table, rows in report.tables.items():
+        logger.info(f"Rebuilt {table} with {rows} rows")
+    logger.info("Database repair finished")
+    return 0
 
 
 def main() -> int:
@@ -54,6 +89,9 @@ Examples:
   
   # Run continuously every 6 hours
   python -m lyra.main --loop
+
+  # Repair a corrupt database (backs it up, then rebuilds it empty)
+  python -m lyra.main --repair-db
         """
     )
 
@@ -106,6 +144,11 @@ Examples:
         action="store_true",
         help="Run interactive downloader CLI"
     )
+    parser.add_argument(
+        "--repair-db",
+        action="store_true",
+        help="Back up the database file and rebuild it empty, then exit"
+    )
 
     args = parser.parse_args()
 
@@ -114,6 +157,11 @@ Examples:
     logger.info("=" * 60)
     logger.info("Lyra Music Automation System - Starting")
     logger.info("=" * 60)
+
+    # Explicit repair runs before any other mode. It has to: the file it repairs
+    # may be one that normal startup cannot open at all.
+    if args.repair_db:
+        return repair_database_mode(Config.DB_PATH)
 
     try:
         # Validate configuration

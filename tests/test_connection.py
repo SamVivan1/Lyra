@@ -3,7 +3,33 @@ import sqlite3
 
 import pytest
 
-from lyra.database.connection import DatabaseConnection
+from lyra.database.connection import DatabaseConnection, integrity_ok
+from lyra.database.errors import DatabaseCorruptError
+
+
+def _database_with_a_corrupt_page(db_path):
+    """Build a readable DB whose page 2 has an invalid b-tree header.
+
+    SQLite still opens this file, but ``PRAGMA integrity_check`` reports the
+    damage: that report, and nothing else, is what may mean "corrupt".
+    """
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA page_size=1024")
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+    conn.executemany("INSERT INTO t (s) VALUES (?)", [("x" * 300,) for _ in range(400)])
+    conn.commit()
+    conn.close()
+
+    data = bytearray(db_path.read_bytes())
+    page_size = int.from_bytes(data[16:18], "big")
+    # The first table b-tree page after the schema page: 0x05 interior, 0x0d leaf.
+    page = next(
+        index
+        for index in range(1, len(data) // page_size)
+        if data[index * page_size] in (0x05, 0x0D)
+    )
+    data[page * page_size] = 0x00  # an invalid b-tree page type
+    db_path.write_bytes(bytes(data))
 
 
 def test_two_instances_do_not_share_path(tmp_path):
@@ -43,35 +69,68 @@ def test_reader_not_blocked_by_open_writer_transaction(tmp_path):
         w.execute("COMMIT")
 
 
-def test_initialize_recovers_from_garbage_database(tmp_path):
-    """A corrupt DB file must not crash startup, and the schema must stay usable."""
+def test_initialize_raises_corrupt_error_and_leaves_file_untouched(tmp_path):
+    """A corrupt DB must not crash startup with a silent rebuild.
+
+    Repair is explicit (``lyra --repair-db``); until the operator runs it the
+    file stays byte-for-byte where it is, because renaming it destroys evidence.
+    """
     db_path = tmp_path / "garbage.db"
-    db_path.write_bytes(b"\x00\x01 not a database at all \x00")
-    db = DatabaseConnection(db_path)
+    original = b"\x00\x01 not a database at all \x00"
+    db_path.write_bytes(original)
 
-    db.initialize()  # must not raise
+    with pytest.raises(DatabaseCorruptError) as excinfo:
+        DatabaseConnection(db_path).initialize()
 
-    with db.get_connection() as c:
-        c.execute(
-            "INSERT INTO artists (artist_name, added_at) VALUES (?, ?)",
-            ("some-artist", "2026-11-11"),
-        )
-        c.commit()
-        assert c.execute("SELECT COUNT(*) FROM artists").fetchone()[0] == 1
-        # WAL is a file property: it must hold for the rebuilt file too.
-        assert c.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    message = str(excinfo.value)
+    assert str(db_path) in message
+    assert "--repair-db" in message
+    assert db_path.read_bytes() == original
+    assert [p.name for p in tmp_path.iterdir()] == [db_path.name]
 
 
-def test_corrupt_database_file_is_backed_up_before_rebuild(tmp_path):
-    """Scoped to today's auto-rename. Task 2 replaces it with an explicit --repair-db,
-    and should update or delete this test rather than the recovery mandate above."""
-    db_path = tmp_path / "corrupt.db"
-    db_path.write_bytes(b"\x00\x01 not a database at all \x00")
+def test_locked_database_is_not_renamed(tmp_path):
+    """A lock is a concurrency condition, never corruption: the file stays put.
 
-    DatabaseConnection(db_path).initialize()
+    The database has no schema yet, so the exclusive lock blocks the ``CREATE
+    TABLE`` that ``initialize()`` must run -- the lock error has to surface, and
+    the live file has to survive it.
+    """
+    db_path = tmp_path / "live.db"
+    sqlite3.connect(db_path).close()  # an empty database, no schema yet
 
-    backups = [p.name for p in tmp_path.iterdir() if p.name.startswith("corrupt.corrupt")]
-    assert len(backups) == 1
+    holder = sqlite3.connect(db_path, timeout=1)
+    holder.isolation_level = None
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            DatabaseConnection(db_path).initialize()
+        assert not list(tmp_path.glob("*.corrupt*"))
+        assert db_path.exists()
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+
+def test_integrity_ok_is_decided_by_integrity_check(tmp_path):
+    """Only ``PRAGMA integrity_check`` may call a file corrupt."""
+    healthy = tmp_path / "healthy.db"
+    DatabaseConnection(healthy).initialize()
+    assert integrity_ok(healthy)
+
+    garbage = tmp_path / "garbage.db"
+    garbage.write_bytes(b"not a database at all" * 50)
+    assert not integrity_ok(garbage)  # raises instead of returning a row
+
+    damaged = tmp_path / "damaged.db"
+    _database_with_a_corrupt_page(damaged)
+    conn = sqlite3.connect(damaged)
+    try:
+        reported = conn.execute("PRAGMA integrity_check").fetchall()
+    finally:
+        conn.close()
+    assert reported != [("ok",)]  # precondition: the fixture is really damaged
+    assert not integrity_ok(damaged)
 
 
 def test_journal_mode_is_checked_not_ignored(tmp_path, caplog):
