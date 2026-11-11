@@ -1,6 +1,12 @@
 # What the Docker daemon must never send into a build context.
 # The image is built from the repository root, so everything here is an
 # exclusion from a context that would otherwise contain real credentials.
+#
+# Patterns are matched by Docker with Go's filepath.Match rules: a pattern with
+# no interior "/" is anchored at the context root and matches nothing deeper,
+# while "**/" spans any number of directories. Anything that exists only in
+# subdirectories (caches, egg-info) therefore needs the "**/" form, or
+# `COPY src/ ./src/` would bake it into the image.
 .env
 .env.*
 .venv/
@@ -10,8 +16,11 @@ data/
 *.log
 cookies.txt
 .pytest_cache/
-__pycache__/
-*.pyc
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+build/
+dist/
 .review/
 .superpowers/
 docs/superpowers/
