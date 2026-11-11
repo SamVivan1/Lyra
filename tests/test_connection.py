@@ -3,6 +3,7 @@ import sqlite3
 
 import pytest
 
+from lyra.database import connection
 from lyra.database.connection import DatabaseConnection, integrity_ok
 from lyra.database.errors import DatabaseCorruptError
 
@@ -147,6 +148,51 @@ def test_journal_mode_is_checked_not_ignored(tmp_path, caplog):
     assert mode.lower() != "wal"  # precondition: a genuine non-WAL answer
     assert "journal_mode" in caplog.text
     assert "wal" in caplog.text.lower()
+
+
+class _LockedThenWalConnection:
+    """Answers the journal-mode switch with ``SQLITE_BUSY`` a few times, then WAL.
+
+    This is what a second process starting at the same time looks like from the
+    other side: it holds the lock while it migrates, and the switch needs the
+    file's exclusive lock, which SQLite refuses rather than waits for.
+    """
+
+    def __init__(self, busy_times: int) -> None:
+        self.calls = 0
+        self._busy_times = busy_times
+
+    def execute(self, _sql: str):
+        self.calls += 1
+        if self.calls <= self._busy_times:
+            raise sqlite3.OperationalError("database is locked")
+        return self
+
+    def fetchone(self):
+        return ("wal",)
+
+
+def test_a_locked_journal_mode_switch_is_retried_and_never_fatal(
+    tmp_path, monkeypatch, caplog
+):
+    """A busy database must not be fatal at startup, and the retry must be bounded.
+
+    The mode is a property of the file, and the process holding the lock is in the
+    middle of setting it; refusing to start over that would make two simultaneous
+    starters fail, which is the case the two-process migration test pins.
+    """
+    monkeypatch.setattr(connection.time, "sleep", lambda _s: None)
+    db = DatabaseConnection(tmp_path / "t.db")
+
+    recovering = _LockedThenWalConnection(busy_times=2)
+    assert db._enable_wal(recovering).lower() == "wal"
+    assert recovering.calls == 3, "the switch was retried until it succeeded"
+
+    still_locked = _LockedThenWalConnection(busy_times=connection.WAL_ATTEMPTS + 5)
+    with caplog.at_level(logging.WARNING, logger="lyra.database.connection"):
+        assert db._enable_wal(still_locked).lower() != "wal"  # never raises
+    assert still_locked.calls == connection.WAL_ATTEMPTS, "the retry is bounded"
+    assert "locked" in caplog.text.lower()
 
 
 def test_get_connection_does_not_leak_connection_when_pragma_fails(tmp_path, monkeypatch):

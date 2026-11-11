@@ -1,17 +1,22 @@
 """
 Database connection and initialization utilities.
 
-Handles SQLite connections and schema initialization.
+Handles SQLite connections and schema initialization. The schema itself lives in
+:mod:`lyra.database.migrations`; this module only opens connections, decides
+whether a file is corrupt rather than merely busy, and applies the concurrency
+pragmas.
 """
 
 import sqlite3
 import logging
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator, Optional, Union
 
 from ..config import Config
 from .errors import DatabaseCorruptError, DatabaseFileError
+from .migrations import apply_migrations
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +26,12 @@ BUSY_TIMEOUT_MS = 5000
 #: Journal mode the concurrency guarantee of this module depends on. It is a
 #: file property: setting it once is enough, but the answer must be checked.
 JOURNAL_MODE = "wal"
+#: Attempts at the journal-mode switch before it is reported as not achieved.
+#: Only lock contention is retried; a negative answer is final.
+WAL_ATTEMPTS = 3
+#: Wait between those attempts. The competing lock is another process starting
+#: up, which holds it for the milliseconds its migration takes.
+WAL_RETRY_DELAY_S = 0.05
 
 
 def integrity_ok(db_path: Union[str, Path]) -> bool:
@@ -77,12 +88,12 @@ class DatabaseConnection:
 
     def initialize(self) -> None:
         """
-        Create the database file, build the schema and apply concurrency PRAGMAs.
+        Create the database file, migrate the schema and apply concurrency PRAGMAs.
 
-        The schema is built first, on purpose: every PRAGMA below raises
-        ``sqlite3.DatabaseError`` on a file that is not a database, and
-        ``_initialize_schema()`` is where that failure gets classified. Nothing
-        here repairs a file: a corrupt database raises
+        Opening the file comes first, on purpose: every PRAGMA and every migration
+        statement raises ``sqlite3.DatabaseError`` on a file that is not a
+        database, and ``_migrate()`` is where that failure gets classified.
+        Nothing here repairs a file: a corrupt database raises
         :class:`DatabaseCorruptError` and stays untouched until an operator runs
         ``lyra --repair-db``.
 
@@ -92,12 +103,40 @@ class DatabaseConnection:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             raise DatabaseFileError(self.path, "create the directory for", e) from e
-        self._initialize_schema()
-        with self.get_connection() as conn:
-            self._enable_wal(conn)
-            self._apply_pragmas(conn)
+        self._migrate()
         self._initialized = True
         logger.info(f"Database initialized at {self.path}")
+
+    def _migrate(self) -> None:
+        """
+        Apply schema migrations, translating an unusable file into an actionable error.
+
+        A lock is re-raised untouched: it is a concurrency condition, and the old
+        recovery path renamed the live file for it, destroying a database that was
+        merely busy. Any other ``sqlite3.DatabaseError`` is only called
+        corruption when ``PRAGMA integrity_check`` agrees; a query that fails
+        while the file checks out is re-raised as it came.
+
+        The migration and the PRAGMAs share the connection because the pragmas
+        below raise on a file that is not a database at all, and that failure
+        belongs to the same classification. The journal-mode switch runs on its
+        own connection, deliberately: another process may have switched the file
+        to WAL while this one was migrating, and a connection that still holds
+        the old journal-mode view fails that switch with ``disk I/O error``.
+        """
+        try:
+            with self.get_connection() as conn:
+                apply_migrations(conn, self.path)
+            with self.get_connection() as conn:
+                self._enable_wal(conn)
+                self._apply_pragmas(conn)
+        except sqlite3.OperationalError:
+            raise
+        except sqlite3.DatabaseError as e:
+            if integrity_ok(self.path):
+                raise
+            raise DatabaseCorruptError(self.path, str(e)) from e
+        logger.debug("Database schema migrated/verified")
 
     def _apply_pragmas(self, conn: sqlite3.Connection) -> None:
         """Apply the per-connection concurrency pragmas."""
@@ -114,10 +153,38 @@ class DatabaseConnection:
         support is not fatal (the database still works), so this warns loudly
         instead of raising and keeps startup alive; the warning is the only
         signal that the concurrency guarantee is not being met.
+
+        A lock is not fatal either, and it is the one failure that is worth
+        retrying: switching the journal mode takes the file's exclusive lock, and
+        SQLite answers ``SQLITE_BUSY`` without waiting when a second connection
+        holds a lock and asks for one at the same time -- which is exactly what a
+        process starting beside this one does. The other process sets the same
+        file property, so losing the race costs nothing but a retry.
         """
-        row = conn.execute(f"PRAGMA journal_mode={JOURNAL_MODE.upper()}").fetchone()
-        mode = (row[0] if row else "") or ""
-        if mode.lower() != JOURNAL_MODE:
+        mode = ""
+        last_error: Optional[sqlite3.OperationalError] = None
+        for attempt in range(1, WAL_ATTEMPTS + 1):
+            try:
+                row = conn.execute(
+                    f"PRAGMA journal_mode={JOURNAL_MODE.upper()}"
+                ).fetchone()
+            except sqlite3.OperationalError as e:
+                last_error = e
+                if attempt < WAL_ATTEMPTS:
+                    time.sleep(WAL_RETRY_DELAY_S)
+                continue
+            last_error = None
+            # A definite answer, even a negative one, is final: only contention
+            # is worth another attempt.
+            mode = (row[0] if row else "") or ""
+            break
+        if last_error is not None:
+            logger.warning(
+                f"Could not switch {self.path} to WAL: {last_error}. Another "
+                "process is using the database; concurrent readers may block on "
+                "open writer transactions until the journal mode is WAL."
+            )
+        elif mode.lower() != JOURNAL_MODE:
             logger.warning(
                 f"SQLite did not enable WAL for {self.path}: "
                 f"journal_mode returned {mode!r} instead of {JOURNAL_MODE!r}. "
@@ -141,7 +208,7 @@ class DatabaseConnection:
             # Inside the try block on purpose: a pragma that raises (a corrupt
             # file gives ``file is not a database``) must not leave the
             # connection open. It is not logged here; callers that classify,
-            # such as ``_initialize_schema()``, do their own reporting.
+            # such as ``_migrate()``, do their own reporting.
             conn.row_factory = sqlite3.Row
             self._apply_pragmas(conn)
             try:
@@ -153,81 +220,3 @@ class DatabaseConnection:
         finally:
             conn.close()
 
-    def _initialize_schema(self) -> None:
-        """
-        Create the schema, translating an unusable file into an actionable error.
-
-        A lock is re-raised untouched: it is a concurrency condition, and the old
-        recovery path renamed the live file for it, destroying a database that was
-        merely busy. Any other ``sqlite3.DatabaseError`` is only called
-        corruption when ``PRAGMA integrity_check`` agrees; a query that fails
-        while the file checks out is re-raised as it came.
-        """
-        try:
-            with self.get_connection() as conn:
-                self._create_schema(conn)
-        except sqlite3.OperationalError:
-            raise
-        except sqlite3.DatabaseError as e:
-            if integrity_ok(self.path):
-                raise
-            raise DatabaseCorruptError(self.path, str(e)) from e
-        logger.debug("Database schema initialized/verified")
-
-    @staticmethod
-    def _create_schema(conn: sqlite3.Connection) -> None:
-        """
-        Create every table and index of the schema, and commit.
-
-        This is the single source of the DDL. Both a fresh database and an
-        explicit repair build the schema through here, so an explicit repair can
-        never drift away from what normal startup builds.
-
-        Args:
-            conn: Open connection to the database to build the schema in.
-        """
-        # Artists tracking table
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS artists (
-                artist_name TEXT PRIMARY KEY,
-                added_at TEXT NOT NULL,
-                fallback_done INTEGER DEFAULT 0,
-                recommended_tracks TEXT
-            )
-        ''')
-
-        # Local library cache table
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS local_library (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                artist TEXT NOT NULL,
-                album TEXT,
-                title TEXT NOT NULL,
-                recording_mbid TEXT,
-                file_path TEXT,
-                added_at TEXT NOT NULL,
-                UNIQUE(artist, title, recording_mbid)
-            )
-        ''')
-
-        # Tracked tracks for fallback table
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS tracked_tracks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                recording_mbid TEXT,
-                artist TEXT NOT NULL,
-                title TEXT NOT NULL,
-                source TEXT DEFAULT 'listenbrainz',
-                status TEXT DEFAULT 'PENDING',
-                added_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(recording_mbid, artist, title)
-            )
-        ''')
-
-        # Create indexes for faster queries
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_local_library_artist ON local_library(artist)')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_local_library_mbid ON local_library(recording_mbid)')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_tracked_tracks_status ON tracked_tracks(status)')
-
-        conn.commit()
