@@ -1,5 +1,4 @@
 import sqlite3
-
 from unittest.mock import MagicMock
 
 from lyra.database.connection import DatabaseConnection

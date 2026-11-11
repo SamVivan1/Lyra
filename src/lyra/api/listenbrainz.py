@@ -5,10 +5,10 @@ Provides methods to fetch recommendations and resolve metadata.
 """
 
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Dict, List, Optional
 
-from .base import BaseAPIClient
 from ..config import Config
+from .base import BaseAPIClient
 
 logger = logging.getLogger(__name__)
 

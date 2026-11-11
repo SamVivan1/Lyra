@@ -7,8 +7,8 @@ This module provides abstractions for:
 - TrackStateManager: Manages individual track fallback state
 """
 
-from .state import StateManager
 from .library_scanner import LibraryScanner
+from .state import StateManager
 from .track_manager import TrackStateManager
 
 __all__ = ["StateManager", "LibraryScanner", "TrackStateManager"]

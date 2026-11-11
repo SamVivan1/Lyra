@@ -7,3 +7,7 @@ __pycache__/
 data/
 music_automation.log
 *.log
+# Coverage tooling (pytest-cov) writes these on every run.
+.coverage
+.coverage.*
+htmlcov/

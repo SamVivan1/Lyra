@@ -7,9 +7,9 @@ Manages the fallback process when tracks are not found in Lidarr after 24 hours.
 import logging
 from typing import Optional
 
-from .downloader import Downloader
-from ..database.state import StateManager
 from ..database.connection import DatabaseConnection
+from ..database.state import StateManager
+from .downloader import Downloader
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +65,8 @@ class FallbackOrchestrator:
         logger.info("Starting fallback check...")
 
         # Import TrackStateManager locally to avoid circular imports
-        from ..database.track_manager import TrackStateManager
         from ..config import Config
+        from ..database.track_manager import TrackStateManager
 
         # The flag travels with the store: this manager is built for the run,
         # and so is a dry state manager if the injected one is not one already.

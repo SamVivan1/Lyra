@@ -8,8 +8,8 @@ import logging
 import os
 from typing import Optional
 
-from mutagen.easyid3 import EasyID3
 import mutagen
+from mutagen.easyid3 import EasyID3
 
 logger = logging.getLogger(__name__)
 

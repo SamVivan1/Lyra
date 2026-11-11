@@ -1,4 +1,4 @@
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 from lyra.api.lidarr import LidarrClient
 from lyra.config import Config

@@ -1,6 +1,6 @@
+import datetime
 import os
 import sqlite3
-import datetime
 
 from lyra.config import Config
 from lyra.database.connection import DatabaseConnection

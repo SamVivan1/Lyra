@@ -47,7 +47,8 @@ def _legacy_db(tmp_path):
                   ("Cup of Joe", "Multo", "Multo", "/music/a.mp3" if i == 0 else None, NOW))
     c.execute("INSERT INTO local_library (artist,album,title,recording_mbid,file_path,added_at)"
               " VALUES ('cup of joe','Multo','multo',NULL,'/music/b.mp3',?)", (NOW,))
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     return db
 
 

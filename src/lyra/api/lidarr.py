@@ -5,10 +5,10 @@ Provides artist search, addition, and monitoring capabilities.
 """
 
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Dict, List, Optional
 
-from .base import BaseAPIClient
 from ..config import Config
+from .base import BaseAPIClient
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +37,11 @@ class LidarrClient(BaseAPIClient):
         self.url = (url or Config.LIDARR_URL).rstrip("/")
         self.api_key = api_key or Config.LIDARR_API_KEY
         
-        headers = {
-            "X-Api-Key": self.api_key,
+        headers: Dict[str, str] = {
+            # An unset key becomes an empty header rather than None, which
+            # requests rejects outright; Config.validate() refuses to start
+            # without a key, so this only affects clients built by hand.
+            "X-Api-Key": self.api_key or "",
             "Accept": "application/json"
         }
         

@@ -5,16 +5,16 @@ Provides interactive menu for manual track downloads and metadata entry.
 """
 
 import logging
-import sys
 import os
+import sys
 import termios
 import tty
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
+    import questionary  # noqa: F401  # imported as an availability probe
     from rich.console import Console
-    from rich.panel import Panel
-    import questionary
+    from rich.panel import Panel  # noqa: F401  # imported as an availability probe
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
@@ -142,7 +142,8 @@ class InteractiveDownloader:
         """Read a single character from stdin without requiring Enter."""
         if os.name == "nt":
             import msvcrt
-            return msvcrt.getwch()
+            # msvcrt is Windows-only; on other platforms its stubs omit getwch.
+            return msvcrt.getwch()  # type: ignore[attr-defined]
 
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
@@ -176,7 +177,12 @@ class InteractiveDownloader:
                 prefix = ">" if index == selected else " "
                 self._print(f" {prefix} {item}")
 
-            self._print("\nUse [bold]hjkl[/bold] or arrow keys to navigate, Enter to select, q to cancel." if HAS_RICH else "\nUse hjkl or arrow keys to navigate, Enter to select, q to cancel.")
+            hint = (
+                "\nUse [bold]hjkl[/bold] or arrow keys to navigate, Enter to select, q to cancel."
+                if HAS_RICH
+                else "\nUse hjkl or arrow keys to navigate, Enter to select, q to cancel."
+            )
+            self._print(hint)
 
             char = self._get_single_character()
             if char in {"j", "J", "l", "L"}:

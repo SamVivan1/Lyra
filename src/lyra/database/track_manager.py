@@ -6,8 +6,8 @@ Manages tracked_tracks table for per-track fallback status and completion.
 
 import logging
 import sqlite3
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 from .connection import DatabaseConnection
 

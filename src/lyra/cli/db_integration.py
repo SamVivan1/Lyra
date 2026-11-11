@@ -7,8 +7,8 @@ Handles database updates from CLI operations.
 import logging
 from typing import Optional
 
-from ..database.state import StateManager
 from ..database.connection import DatabaseConnection
+from ..database.state import StateManager
 
 logger = logging.getLogger(__name__)
 

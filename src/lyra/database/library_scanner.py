@@ -4,11 +4,11 @@ Library scanning and filesystem indexing.
 Scans music library directory for audio files and indexes metadata into local_library.
 """
 
+import glob
 import logging
 import os
-import glob
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
 import mutagen
 from mutagen import File as MutagenFile
@@ -183,7 +183,7 @@ class LibraryScanner:
         Returns:
             Dictionary with artist, title, album, recording_mbid
         """
-        metadata = {
+        metadata: Dict[str, Optional[str]] = {
             'artist': None,
             'title': None,
             'album': None,
@@ -241,7 +241,7 @@ class LibraryScanner:
         Returns:
             Dictionary with inferred artist, album, title
         """
-        metadata = {'artist': None, 'album': None, 'title': None}
+        metadata: Dict[str, Optional[str]] = {'artist': None, 'album': None, 'title': None}
         rel_path = os.path.relpath(file_path, self.library_path)
         parts = rel_path.replace('\\', '/').split('/')
         

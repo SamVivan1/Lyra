@@ -7,7 +7,8 @@ for all external API clients.
 
 import logging
 import time
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
+
 import requests
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,8 @@ class BaseAPIClient:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error {e.response.status_code} on GET {endpoint}: {e}")
+            status = e.response.status_code if e.response is not None else None
+            logger.error(f"HTTP error {status} on GET {endpoint}: {e}")
             return None
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error on GET {endpoint}: {e}")
@@ -120,7 +122,8 @@ class BaseAPIClient:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error {e.response.status_code} on POST {endpoint}: {e}")
+            status = e.response.status_code if e.response is not None else None
+            logger.error(f"HTTP error {status} on POST {endpoint}: {e}")
             return None
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error on POST {endpoint}: {e}")

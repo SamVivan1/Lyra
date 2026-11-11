@@ -13,11 +13,10 @@ from pathlib import Path
 from typing import Optional
 
 from .config import Config
-from .logging_config import setup_logger, configure_root_logger
 from .database.connection import DatabaseConnection
 from .database.errors import DatabaseCorruptError, DatabaseFileError
-from .database.library_scanner import LibraryScanner
 from .database.maintenance import repair_database
+from .logging_config import configure_root_logger, setup_logger
 from .orchestrator import ApplicationOrchestrator
 
 # Named explicitly rather than with ``__name__``: ``python -m lyra.main`` runs

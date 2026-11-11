@@ -7,12 +7,12 @@ Coordinates artist addition, track tracking, and fallback downloads.
 import logging
 from typing import Optional
 
-from ..api import ListenBrainzClient, LidarrClient
-from ..database.state import StateManager
+from ..api import LidarrClient, ListenBrainzClient
+from ..config import Config
 from ..database.connection import DatabaseConnection
+from ..database.state import StateManager
 from ..database.track_manager import TrackStateManager
 from ..downloader import FallbackOrchestrator
-from ..config import Config
 
 logger = logging.getLogger(__name__)
 

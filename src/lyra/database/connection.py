@@ -7,8 +7,8 @@ whether a file is corrupt rather than merely busy, and applies the concurrency
 pragmas.
 """
 
-import sqlite3
 import logging
+import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path

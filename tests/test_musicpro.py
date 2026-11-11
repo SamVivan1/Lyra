@@ -1,10 +1,9 @@
 import os
-import tempfile
 from unittest.mock import patch
 
 from lyra.api.musicbrainz import MusicBrainzClient
-from lyra.downloader.downloader import Downloader
 from lyra.cli.interactive import InteractiveDownloader
+from lyra.downloader.downloader import Downloader
 
 
 def test_extract_release_metadata_from_recording():

@@ -4,9 +4,9 @@ Core state management for library and artist tracking.
 Refactored StateManager that coordinates local library and artist tracking.
 """
 
+import json
 import logging
 import sqlite3
-import json
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -243,8 +243,8 @@ class StateManager:
         Args:
             force_rescan: Force full rescan if True
         """
-        from .library_scanner import LibraryScanner
         from ..config import Config
+        from .library_scanner import LibraryScanner
 
         if self.dry_run:
             logger.info("[DRY RUN] Library index will not be written")

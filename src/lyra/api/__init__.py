@@ -8,9 +8,9 @@ Provides abstractions for:
 """
 
 from .base import BaseAPIClient
+from .lidarr import LidarrClient
 from .listenbrainz import ListenBrainzClient
 from .musicbrainz import MusicBrainzClient
-from .lidarr import LidarrClient
 
 __all__ = [
     "BaseAPIClient",

@@ -8,7 +8,7 @@ Provides abstractions for:
 """
 
 from .downloader import Downloader
-from .metadata_handler import MetadataHandler
 from .fallback_orchestrator import FallbackOrchestrator
+from .metadata_handler import MetadataHandler
 
 __all__ = ["Downloader", "MetadataHandler", "FallbackOrchestrator"]
