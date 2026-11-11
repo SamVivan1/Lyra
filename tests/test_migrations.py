@@ -21,11 +21,12 @@ import logging
 import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 
 from lyra.database import migrations
-from lyra.database.connection import DatabaseConnection
+from lyra.database.connection import BUSY_TIMEOUT_MS, DatabaseConnection
 
 LEGACY = """
 CREATE TABLE local_library (
@@ -1001,3 +1002,107 @@ def test_a_legacy_row_without_a_status_is_queued_as_new(tmp_path):
     DatabaseConnection(db).initialize()
 
     assert [row[4] for row in _tracked_rows(db)] == ["NEW", "NEW"]
+
+
+def _legacy_db_with_duplicate_tracks(tmp_path):
+    """A v0 database whose ``tracked_tracks`` holds the duplicate v2 merges."""
+    db = _legacy_db_with(
+        tmp_path / "both.db", [("Cup of Joe", "Multo", None, "/music/a.mp3")]
+    )
+    c = sqlite3.connect(db)
+    c.executescript("""
+    CREATE TABLE tracked_tracks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, recording_mbid TEXT, artist TEXT NOT NULL,
+        title TEXT NOT NULL, source TEXT DEFAULT 'listenbrainz', status TEXT DEFAULT 'PENDING',
+        added_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(recording_mbid, artist, title));
+    """)
+    c.executemany(
+        "INSERT INTO tracked_tracks (artist,title,status,added_at,updated_at)"
+        " VALUES ('Artist','Song',?,?,?)",
+        [("PENDING", NOW, NOW), ("COMPLETED", NOW, NOW)],
+    )
+    c.commit()
+    c.close()
+    return db
+
+
+def test_a_committed_migration_still_starts_when_the_report_cannot_be_written(
+    tmp_path, caplog
+):
+    """A committed merge must not fail startup because a report could not be written.
+
+    Regression: the report is written after the commit, yet an unwritable path
+    raised out of ``initialize()`` -- so startup exited 1 for a database that was
+    already healthy and merged, and a later start never wrote the report either
+    (the version was current). The dropped lines are the operator's only record;
+    they go to the log at ERROR instead, and startup carries on.
+    """
+    db = _legacy_db_with_duplicate_tracks(tmp_path)
+    # A directory squats on the path the report would be written to.
+    (tmp_path / "migration-duplicates-2.txt").mkdir()
+
+    conn = DatabaseConnection(db)
+    with caplog.at_level(logging.ERROR):
+        conn.initialize()  # the migration committed, so this must not raise
+
+    assert _user_version(db) == 2
+    with conn.get_connection() as c:
+        rows = [tuple(r) for r in c.execute(
+            "SELECT artist,title,status FROM tracked_tracks"
+        ).fetchall()]
+    assert rows == [("Artist", "Song", "COMPLETED")], "the merge really happened"
+    assert "Could not write the duplicate report" in caplog.text
+    assert "Artist\tSong" in caplog.text, "the dropped row is still on record"
+
+
+def test_the_migration_connection_waits_longer_than_an_ordinary_connection(
+    tmp_path, monkeypatch
+):
+    """The migration transaction runs on a raised ``busy_timeout`` (design §10).
+
+    The second starter is promised a wait of up to ``busy_timeout`` before it
+    gives up and skips. 5 s -- the value an ordinary connection uses -- is sized
+    for the cheap journal-mode switch, not for a migration that rewrites whole
+    tables on a slow disk, so the migration connection waits far longer.
+    """
+    db = _legacy_db(tmp_path)
+    seen = {}
+    real = migrations._migrate_v1
+
+    def spy(conn, db_path):
+        seen["busy_timeout"] = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        return real(conn, db_path)
+
+    monkeypatch.setattr(migrations, "_migrate_v1", spy)
+
+    DatabaseConnection(db).initialize()
+
+    assert seen["busy_timeout"] == migrations.MIGRATION_BUSY_TIMEOUT_MS
+    assert seen["busy_timeout"] > BUSY_TIMEOUT_MS
+
+
+def test_the_raised_timeout_governs_begin_immediate_itself(tmp_path, monkeypatch):
+    """The pragma is applied *before* the lock, or it would be pointless.
+
+    The timeout is injected short here so the test is fast: with the pragma set
+    before ``BEGIN IMMEDIATE`` the lock wait gives up after 100 ms, whereas a
+    pragma applied after it would leave the statement on the connection's 5 s
+    default -- the regression this guards against.
+    """
+    db = _legacy_db(tmp_path)
+    monkeypatch.setattr(migrations, "MIGRATION_BUSY_TIMEOUT_MS", 100)
+
+    holder = sqlite3.connect(db, timeout=1)
+    holder.isolation_level = None
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            DatabaseConnection(db).initialize()
+        elapsed = time.monotonic() - started
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    assert elapsed < 3.0, "the injected 100 ms timeout must govern BEGIN IMMEDIATE"

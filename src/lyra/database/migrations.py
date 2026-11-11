@@ -23,7 +23,9 @@ Four rules make that true, and each is easy to lose:
   back cannot unlink a file, so a report written inside the transaction would
   survive the rollback and describe paths that are still in the database. Since
   the committed schema is the only thing that makes those paths really dropped,
-  the report follows it.
+  the report follows it -- and a report that cannot be written is logged at
+  ERROR and never fails startup, because by then the database is already healthy
+  and merged.
 
 Migration v1 replaces the old table-level ``UNIQUE(artist, title,
 recording_mbid)`` on ``local_library`` with the natural key
@@ -52,12 +54,21 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable, List, Optional, Union
 
-from .errors import DatabaseFileError
-
 logger = logging.getLogger(__name__)
 
 #: Current schema version. Bump this and add ``_migrate_v<n>`` together.
 SCHEMA_VERSION = 2
+
+#: How long the migration transaction waits for another process's write lock, in
+#: milliseconds. The ordinary per-connection value (``connection.BUSY_TIMEOUT_MS``,
+#: 5 s) exists for the cheap lock the journal-mode switch takes. A migration is
+#: the opposite case: it rewrites ``local_library``/``tracked_tracks``, and on a
+#: large library and a slow disk it can hold that lock far longer than 5 s. The
+#: design promises the second starter waits up to ``busy_timeout`` and then skips
+#: (``BEGIN IMMEDIATE`` + a version re-read), so the wait is sized for the work
+#: it covers. This applies to the migration connection only; readers and ordinary
+#: writers keep the short timeout, where failing fast is the better answer.
+MIGRATION_BUSY_TIMEOUT_MS = 60000
 
 #: Report written next to the database for the rows a migration drops. One file
 #: per version, so v1's list of dropped audio file paths is not overwritten by
@@ -221,12 +232,14 @@ def apply_migrations(
 
     A lock that cannot be taken is fatal here, deliberately, and is the one
     failure this function cleans up after. ``BEGIN IMMEDIATE`` waits the
-    connection's ``busy_timeout`` (5 s) before answering ``database is locked``,
-    which is longer than a competing starter's migration takes, so it is not a
-    race worth retrying; and carrying on without the lock would report a schema
-    that is still at the old version as migrated, which is worse than refusing to
-    start. What must not survive it is the backup, which is taken before the lock
-    and therefore exists for a migration that never ran.
+    connection's ``busy_timeout`` before answering ``database is locked``. That
+    timeout is raised to :data:`MIGRATION_BUSY_TIMEOUT_MS` on this connection
+    first, so a competing starter's migration -- which rewrites whole tables and
+    can outlast the 5 s an ordinary connection allows -- is waited out instead of
+    killing the second process. Carrying on without the lock would report a
+    schema that is still at the old version as migrated, which is worse than
+    refusing to start. What must not survive a failure is the backup, which is
+    taken before the lock and therefore exists for a migration that never ran.
 
     Args:
         conn: Open connection to the database to migrate.
@@ -238,6 +251,11 @@ def apply_migrations(
     db_path = Path(db_path)
     if _user_version(conn) >= SCHEMA_VERSION:
         return []
+
+    # Set before the lock is taken, on this connection only: the timeout is what
+    # ``BEGIN IMMEDIATE`` below waits on. Applying it afterwards would be a no-op
+    # for the one lock this module has to survive.
+    conn.execute(f"PRAGMA busy_timeout={MIGRATION_BUSY_TIMEOUT_MS}")
 
     # The backup is taken *before* the lock, and that order is load-bearing.
     # Copying the database opens and closes a descriptor on the file, and POSIX
@@ -683,6 +701,13 @@ def _write_duplicate_report(
     rollback undoes rows but not files, so a report written first would survive
     a failed commit and name paths the database still references.
 
+    A write failure is reported, never raised. By the time this runs the merge is
+    committed and the database is healthy; failing startup over a report would
+    tell the operator their data is broken when it is not, and a later start
+    would not retry the write anyway (the version is current). The dropped lines
+    go into the log at ERROR instead, so the operator still gets the only record
+    of what the merge removed.
+
     Args:
         db_path: Path of the database the report belongs to.
         version: Schema version of the migration that dropped the rows.
@@ -706,10 +731,11 @@ def _write_duplicate_report(
         # record of what the merge dropped.
         logger.error(
             f"Could not write the duplicate report for {db_path}: {e}. "
-            f"The rows it describes are already merged; the dropped rows were: "
+            "The migration itself committed and the rows it describes are "
+            "already merged, so startup continues. The dropped rows were: "
             f"{'; '.join(lines)}"
         )
-        raise DatabaseFileError(db_path, "write the duplicate report for", e) from e
+        return None
     logger.warning(
         f"Dropped {len(lines)} row(s) while migrating {db_path}; "
         f"they are listed in {report_path}."
