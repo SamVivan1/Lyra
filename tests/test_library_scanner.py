@@ -219,3 +219,30 @@ class TestExtractMetadata:
             "album": "Sample Album",
             "recording_mbid": "7d4f5a6b-4444-4555-8666-777777777777",
         }
+
+
+class TestScanDoesNotFollowSymlinks:
+    """A library can hold a symlink that points back at its own root.
+
+    glob('**/*', recursive=True) follows it and re-walks the tree, indexing one
+    real file under many paths -- on a real host, 156 audio files were reported
+    as 6396 tracks. os.walk(followlinks=False) indexes each file once.
+    """
+
+    def test_a_symlink_loop_does_not_inflate_the_index(self, tmp_path):
+        from lyra.database.connection import DatabaseConnection
+        from lyra.database.library_scanner import LibraryScanner
+
+        library = tmp_path / "Music"
+        album = library / "Artist" / "Album"
+        album.mkdir(parents=True)
+        (album / "Song.mp3").write_bytes(b"\x00")
+        (library / "loop").symlink_to(library, target_is_directory=True)
+
+        db = DatabaseConnection(tmp_path / "t.db")
+        db.initialize()
+        added = LibraryScanner(str(library), db).scan_library()
+
+        assert added == 1, "the loop must not multiply the one real track"
+        with db.get_connection() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM local_library").fetchone()[0] == 1

@@ -4,7 +4,6 @@ Library scanning and filesystem indexing.
 Scans music library directory for audio files and indexes metadata into local_library.
 """
 
-import glob
 import logging
 import os
 from pathlib import Path
@@ -143,32 +142,34 @@ class LibraryScanner:
             logger.warning(f"Library path does not exist: {self.library_path}")
             return 0
 
-        files = glob.glob(
-            os.path.join(self.library_path, '**', '*'),
-            recursive=True
-        )
         added = 0
 
-        for file_path in files:
-            if not os.path.isfile(file_path):
-                continue
-            
-            if os.path.splitext(file_path)[1].lower() not in AUDIO_EXTENSIONS:
-                continue
+        # os.walk with followlinks=False, not glob('**/*', recursive=True): glob
+        # follows symlinks. A library can contain one that points back at its own
+        # root -- this host has exactly that -- and following it re-walks the tree,
+        # indexing the same file under many paths (156 real files read as 6396
+        # "tracks" here) while materialising a 13k-entry list in memory. Walking
+        # without following links indexes every real file exactly once and never
+        # reads anything outside the configured library.
+        for root_dir, _subdirs, filenames in os.walk(self.library_path, followlinks=False):
+            for filename in filenames:
+                if os.path.splitext(filename)[1].lower() not in AUDIO_EXTENSIONS:
+                    continue
 
-            metadata = self._extract_metadata(file_path)
-            if not metadata['artist'] or not metadata['title']:
-                logger.debug(f"Skipping file without essential metadata: {file_path}")
-                continue
+                file_path = os.path.join(root_dir, filename)
+                metadata = self._extract_metadata(file_path)
+                if not metadata['artist'] or not metadata['title']:
+                    logger.debug(f"Skipping file without essential metadata: {file_path}")
+                    continue
 
-            if self.state_manager.add_local_track(
-                metadata['artist'],
-                metadata['title'],
-                album=metadata['album'],
-                recording_mbid=metadata['recording_mbid'],
-                file_path=file_path
-            ):
-                added += 1
+                if self.state_manager.add_local_track(
+                    metadata['artist'],
+                    metadata['title'],
+                    album=metadata['album'],
+                    recording_mbid=metadata['recording_mbid'],
+                    file_path=file_path
+                ):
+                    added += 1
 
         logger.info(f"Library scan completed: {added} tracks indexed")
         return added
