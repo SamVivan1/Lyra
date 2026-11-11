@@ -8,6 +8,7 @@ empty schema -- happens only when an operator asks for it with
 ``lyra --repair-db``.
 """
 
+import logging
 import os
 import shutil
 import sqlite3
@@ -17,6 +18,8 @@ from pathlib import Path
 
 from .connection import DatabaseConnection, integrity_ok
 from .errors import DatabaseFileError
+
+logger = logging.getLogger(__name__)
 
 #: SQLite sidecar suffixes. ``-wal`` holds commits that are not folded into the
 #: main file yet and ``-shm`` is its transient shared-memory index. Both belong
@@ -28,7 +31,16 @@ SHM_SUFFIX = "-shm"
 
 @dataclass
 class RepairReport:
-    """What an explicit repair did, for the operator and for the log."""
+    """
+    What an explicit repair did, for the operator and for the log.
+
+    Attributes:
+        backup_path: Where the pre-repair file was saved.
+        tables: ``{table: rows}`` **of the old database**, counted in the backup,
+            so the operator can see what the rebuild cost. Empty when the old
+            file was too damaged to count.
+        integrity_ok: Whether the *rebuilt* database passes its integrity check.
+    """
 
     backup_path: Path
     tables: dict[str, int]
@@ -88,21 +100,27 @@ def repair_database(db_path: Path) -> RepairReport:
 
     The backup always happens first, so an unbacked file is never touched. The
     old file and its sidecars are then removed rather than renamed: a leftover
-    ``-wal`` beside the rebuilt file would be replayed into it. Row counts in
-    the report are the rows the rebuilt (empty) database has, which is how the
-    operator sees what the old file could no longer be read for.
+    ``-wal`` beside the rebuilt file would be replayed into it.
+
+    The row counts in the report are the rows of the **old** file, counted in the
+    backup taken a moment earlier. That is what the operator needs: the rebuilt
+    database is empty by construction, so counting it would always say "nothing
+    was lost" -- exactly when everything was.
 
     Args:
         db_path: Path of the database file to repair.
 
     Returns:
-        A :class:`RepairReport` naming the backup and summarising the new file.
+        A :class:`RepairReport` naming the backup and saying what it held.
 
     Raises:
         DatabaseFileError: If the backup or the replacement could not be done.
     """
     db_path = Path(db_path)
     backup_path = backup_database(db_path)
+    # Counted before the old file is replaced, and from the backup, so the
+    # numbers describe the file as it was backed up even if a later step fails.
+    lost_rows = _lost_row_counts(backup_path)
     try:
         for path in (
             db_path,
@@ -120,9 +138,36 @@ def repair_database(db_path: Path) -> RepairReport:
     DatabaseConnection(db_path).initialize()
     return RepairReport(
         backup_path=backup_path,
-        tables=_table_row_counts(db_path),
+        tables=lost_rows,
         integrity_ok=integrity_ok(db_path),
     )
+
+
+def _lost_row_counts(backup_path: Path) -> dict[str, int]:
+    """
+    Count the rows the repair is about to lose, read from the pre-repair backup.
+
+    Best effort: a file too damaged to read must not turn a repair into a second
+    failure, so an unreadable backup yields an empty mapping and a warning. An
+    empty mapping is honest ("how much was lost is unknown"); a mapping of zeros
+    would read as "nothing was lost", which is the confusion this report exists
+    to remove. Reading the backup may fold its own ``-wal`` copy into it; the
+    live database is never involved.
+
+    Args:
+        backup_path: Backup written just before the rebuild.
+
+    Returns:
+        ``{table: rows}`` of the old database, or ``{}`` if it cannot be read.
+    """
+    try:
+        return _table_row_counts(backup_path)
+    except (sqlite3.Error, OSError) as e:
+        logger.warning(
+            f"Could not count the rows in the pre-repair backup at {backup_path}: {e}. "
+            "The report carries no row counts; how much the old database held is unknown."
+        )
+        return {}
 
 
 def _table_row_counts(db_path: Path) -> dict[str, int]:

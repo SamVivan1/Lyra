@@ -6,6 +6,7 @@ Provides CLI argument parsing and orchestration entry point.
 
 import argparse
 import logging
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -55,9 +56,39 @@ def repair_database_mode(db_path: str) -> int:
         logger.error(f"Rebuilt database at {db_path} failed its integrity check")
         return 1
     for table, rows in report.tables.items():
-        logger.info(f"Rebuilt {table} with {rows} rows")
+        logger.info(f"The old database had {rows} rows in {table}")
+    if not report.tables:
+        logger.warning(
+            f"Could not count the rows in the old database at {db_path}; "
+            f"the backup at {report.backup_path} is the only copy of them"
+        )
     logger.info("Database repair finished")
     return 0
+
+
+def _startup_error_message(error: Exception, db_path: str) -> str:
+    """
+    Turn a failure to open the database at startup into one actionable line.
+
+    ``DatabaseCorruptError`` and ``DatabaseFileError`` already name the file and
+    say what to do with it, so their message is used unchanged (the corrupt one
+    names ``lyra --repair-db``). A bare ``sqlite3`` error carries no advice: a
+    locked or unopenable database is a concurrency/path condition, not evidence
+    of corruption, so it must not be answered with the repair command.
+
+    Args:
+        error: The exception that escaped ``initialize()``.
+        db_path: Database path startup was using, for the message.
+
+    Returns:
+        A single log line for the operator, without a traceback.
+    """
+    if isinstance(error, (DatabaseCorruptError, DatabaseFileError)):
+        return str(error)
+    return (
+        f"Could not open the database at {db_path}: {error}. "
+        "Check that the path is a writable file that no other process is using."
+    )
 
 
 def main() -> int:
@@ -179,7 +210,14 @@ Examples:
 
     # Initialize components
     db_connection = DatabaseConnection(Config.DB_PATH)
-    db_connection.initialize()
+    try:
+        db_connection.initialize()
+    except (DatabaseCorruptError, DatabaseFileError, sqlite3.Error) as e:
+        # Without this the operator meets a raw traceback instead of the advice
+        # these errors were written to carry -- the `lyra --repair-db` hint, the
+        # unwritable path, or the busy database. Reporting only: never repair.
+        logger.error(_startup_error_message(e, Config.DB_PATH))
+        return 1
     orchestrator = ApplicationOrchestrator(db_connection)
 
     # Ensure library is indexed
