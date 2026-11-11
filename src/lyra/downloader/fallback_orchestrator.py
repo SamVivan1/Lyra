@@ -115,7 +115,10 @@ class FallbackOrchestrator:
                     added_at=state_writes._now_iso()
                 )
                 track_manager.mark_tracked_track_completed(track_id=track_id)
-                logger.info(f"Fallback completed for '{artist} - {title}'")
+                logger.info(
+                    f"{'[DRY RUN] Would have completed' if dry_run else 'Fallback completed'}"
+                    f" for '{artist} - {title}'"
+                )
             else:
                 logger.warning(
                     f"Fallback download failed for '{artist} - {title}'. "

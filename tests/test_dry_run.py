@@ -6,6 +6,7 @@ hold the flag on the objects that own the writes and assert on the database and
 on the absence of the external call, not on the log line alone.
 """
 
+import logging
 import sqlite3
 from unittest.mock import MagicMock
 
@@ -246,8 +247,103 @@ def test_orchestrator_store_is_dry_without_the_call_flag(db, monkeypatch):
     assert _count(db, "tracked_tracks") == 0
 
 
-def test_orchestrator_wet_run_still_writes_and_adds(db):
+def test_orchestrator_rejects_a_dry_run_with_a_wet_store(db):
+    """The contradiction is refused at construction, not compensated later.
+
+    A dry orchestrator writing through a wet store is the hole this task
+    exists to close. Making the pair unconstructible closes it for every
+    route at once, instead of each method having to remember to compensate.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        ApplicationOrchestrator(db, state_manager=StateManager(db), dry_run=True)
+
+    message = str(excinfo.value)
+    assert "state_manager" in message
+    assert "dry_run=True" in message
+    assert "dry_run=False" in message
+    assert "StateManager" in message  # the fix, not only the contradiction
+
+
+def test_orchestrator_dry_with_a_dry_store_keeps_the_indexed_library(
+    db, tmp_path, monkeypatch
+):
+    """No compensation needed: the dry store the orchestrator holds cannot clear."""
+    album = tmp_path / "Music" / "A" / "B"
+    album.mkdir(parents=True)
+    (album / "S.mp3").write_bytes(b"\x00")
+    monkeypatch.setattr(Config, "LIBRARY_PATH", str(tmp_path / "Music"), raising=False)
+
+    StateManager(db).ensure_library_indexed(force_rescan=True)
+    assert _count(db, "local_library") == 1
+
+    orch = ApplicationOrchestrator(
+        db, state_manager=StateManager(db, dry_run=True), dry_run=True
+    )
+    orch.ensure_library_indexed(force_rescan=True)
+
+    assert _count(db, "local_library") == 1
+
+
+def test_orchestrator_dry_with_a_dry_store_downloads_nothing(
+    db, tmp_path, monkeypatch
+):
+    """The fallback path of a dry orchestrator cannot reach a download."""
+    tm = TrackStateManager(db)
+    tm.add_tracked_track(None, "Fallback Artist", "Fallback Song")
+    with sqlite3.connect(str(tmp_path / "t.db")) as raw:
+        raw.execute(
+            "UPDATE tracked_tracks SET added_at = ?, updated_at = ?",
+            ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00"),
+        )
+
+    spawned = []
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: spawned.append(a))
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("dry run spawned")),
+    )
+
+    orch = ApplicationOrchestrator(
+        db, state_manager=StateManager(db, dry_run=True), dry_run=True
+    )
+    orch.run_fallback()
+
+    assert spawned == []
+    assert _count(db, "local_library") == 0
+    with db.get_connection() as c:
+        status = c.execute("SELECT status FROM tracked_tracks").fetchone()[0]
+    assert status == "NEW"
+
+
+def test_fallback_dry_run_never_logs_a_real_completion(db, tmp_path, monkeypatch, caplog):
+    """A simulated download must not end with "Fallback completed"."""
+    tm = TrackStateManager(db)
+    tm.add_tracked_track(None, "Fallback Artist", "Fallback Song")
+    with sqlite3.connect(str(tmp_path / "t.db")) as raw:
+        raw.execute(
+            "UPDATE tracked_tracks SET added_at = ?, updated_at = ?",
+            ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00"),
+        )
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("dry run spawned")),
+    )
+
+    orchestrator = FallbackOrchestrator(
+        state_manager=StateManager(db, dry_run=True),
+        downloader=Downloader(library_path=str(tmp_path / "Library"), dry_run=True),
+    )
+    with caplog.at_level(logging.INFO):
+        orchestrator.run_fallback(dry_run=True)
+
+    assert "[DRY RUN] Would have completed" in caplog.text
+    assert "Fallback completed for" not in caplog.text
+
+
+def test_orchestrator_wet_run_still_writes_and_adds(db, monkeypatch):
     """The single code path must still do the real work outside dry run."""
+    monkeypatch.setattr(Config, "validate", classmethod(lambda cls: None))
     orch = ApplicationOrchestrator(db)
     orch.lb_client = MagicMock()
     orch.lb_client.get_recommended_artists_with_tracks.return_value = {

@@ -42,11 +42,33 @@ class ApplicationOrchestrator:
 
         Args:
             db_connection: DatabaseConnection instance
-            state_manager: StateManager instance
+            state_manager: StateManager instance. An injected store may not be
+                wet while this orchestrator is dry.
             dry_run: If True, no row is written and no artist is posted to Lidarr
+
+        Raises:
+            ValueError: If ``dry_run=True`` is combined with an injected
+                StateManager whose own ``dry_run`` is False. A dry orchestrator
+                would then write through a wet store, which is the hole this
+                flag exists to close; refusing the pair here means no method
+                has to compensate for it.
         """
         self.db = db_connection or DatabaseConnection()
-        self.dry_run = dry_run or (getattr(state_manager, "dry_run", False) is True)
+
+        if (
+            state_manager is not None
+            and dry_run
+            and getattr(state_manager, "dry_run", False) is not True
+        ):
+            raise ValueError(
+                "ApplicationOrchestrator(dry_run=True) was given a "
+                "state_manager with dry_run=False: the orchestrator would "
+                "write through a wet store. Build the StateManager with "
+                "dry_run=True, or leave state_manager out so the orchestrator "
+                "builds a dry one."
+            )
+
+        self.dry_run = dry_run
         self.state_manager = state_manager or StateManager(self.db, dry_run=self.dry_run)
 
         self.lb_client = ListenBrainzClient()
@@ -81,29 +103,20 @@ class ApplicationOrchestrator:
         """
         Add recommended artists to Lidarr and track their recommended tracks.
 
-        One code path serves both modes. The write-capable objects decide what
-        happens to a write, so the only thing the dry run changes here is the
-        POST to Lidarr, which no store can intercept.
+        One code path serves both modes. The stores decide what happens to a
+        write: they are dry whenever this orchestrator is, and the constructor
+        refuses the opposite pair. The call-level flag can therefore only gate
+        the POST to Lidarr, which no store can intercept.
 
         Args:
             limit: Maximum number of artists to add per run
-            dry_run: If True, don't perform actual operations (or-ed with the
-                orchestrator's own flag)
+            dry_run: If True, don't post to Lidarr (or-ed with the
+                orchestrator's own flag; the stores own every other write)
             
         Returns:
             Number of artists successfully added
         """
         dry_run = dry_run or self.dry_run
-
-        # The flag belongs to the store that writes, so a call-level flag has to
-        # reach one before the first write. The orchestrator's own managers are
-        # reused when they already agree, so an injected manager stays in charge.
-        state_writes = self.state_manager
-        track_writes = self.track_manager
-        if dry_run and getattr(state_writes, "dry_run", False) is not True:
-            state_writes = StateManager(self.db, dry_run=True)
-        if dry_run and getattr(track_writes, "dry_run", False) is not True:
-            track_writes = TrackStateManager(self.db, dry_run=True)
 
         logger.info("Starting artist addition from ListenBrainz recommendations...")
         
@@ -139,7 +152,7 @@ class ApplicationOrchestrator:
             else:
                 logger.info(f"Adding new artist: {artist}")
                 if self._add_artist_to_lidarr(artist, dry_run):
-                    state_writes.add_artist(artist, recommended_tracks=tracks)
+                    self.state_manager.add_artist(artist, recommended_tracks=tracks)
                     added_count += 1
 
             # Track recommended tracks for fallback
@@ -150,7 +163,7 @@ class ApplicationOrchestrator:
                     )
                     continue
 
-                track_writes.add_tracked_track(
+                self.track_manager.add_tracked_track(
                     None,
                     artist,
                     track,
