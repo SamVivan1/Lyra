@@ -5,7 +5,7 @@ The schema version lives in SQLite's own ``PRAGMA user_version``, so the version
 and the data it describes are committed together: a migration that fails
 half-way leaves neither a changed schema nor a raised version behind.
 
-Two rules make that true, and both are easy to lose:
+Four rules make that true, and each is easy to lose:
 
 * every statement runs through ``execute()``. ``executescript()`` commits the
   open transaction before it runs, which would break the atomicity this module
@@ -19,6 +19,11 @@ Two rules make that true, and both are easy to lose:
   -- is released when a process closes any descriptor for the locked file. A
   backup taken inside the transaction would drop the very lock the second rule
   depends on.
+* the duplicate report is written *after* the commit, not before it. Rolling
+  back cannot unlink a file, so a report written inside the transaction would
+  survive the rollback and describe paths that are still in the database. Since
+  the committed schema is the only thing that makes those paths really dropped,
+  the report follows it.
 
 Migration v1 replaces the old table-level ``UNIQUE(artist, title,
 recording_mbid)`` on ``local_library`` with the natural key
@@ -120,6 +125,15 @@ def apply_migrations(
     the schema, so re-reading it is what makes "migrate once" true across
     processes.
 
+    A lock that cannot be taken is fatal here, deliberately, and is the one
+    failure this function cleans up after. ``BEGIN IMMEDIATE`` waits the
+    connection's ``busy_timeout`` (5 s) before answering ``database is locked``,
+    which is longer than a competing starter's migration takes, so it is not a
+    race worth retrying; and carrying on without the lock would report a schema
+    that is still at the old version as migrated, which is worse than refusing to
+    start. What must not survive it is the backup, which is taken before the lock
+    and therefore exists for a migration that never ran.
+
     Args:
         conn: Open connection to the database to migrate.
         db_path: Path of that database, used for the backup and the dup report.
@@ -141,7 +155,21 @@ def apply_migrations(
     backup_path = _backup_before_migrating(conn, db_path)
 
     applied: List[int] = []
-    conn.execute("BEGIN IMMEDIATE")
+    dropped: List[str] = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except BaseException as e:
+        # No transaction is open, so there is nothing to roll back -- but the
+        # copy above protects a migration that is not going to happen, and
+        # leaving it would make ``db.backup-*`` mean less than "a migration
+        # ran". The error keeps its own type: ``_migrate()`` classifies a lock
+        # as a concurrency condition, never as corruption.
+        _discard_backup(backup_path, f"the write lock could not be taken ({e})")
+        logger.warning(
+            f"Could not migrate {db_path}: {e}. Startup is failing rather than "
+            "running against a schema that is not current."
+        )
+        raise
     try:
         version = _user_version(conn)
         if version >= SCHEMA_VERSION:
@@ -149,20 +177,26 @@ def apply_migrations(
             # copy just taken is not the pre-migration state a backup is for --
             # it may even be a snapshot from the middle of that process's
             # transaction -- so it goes again rather than being left behind.
-            _discard_backup(backup_path)
+            _discard_backup(backup_path, "another process migrated the database first")
             conn.commit()
             return []
         if version < 1:
-            _migrate_v1(conn, db_path)
+            dropped = _migrate_v1(conn, db_path)
             applied.append(1)
         conn.commit()
     except BaseException:
         conn.rollback()
         raise
+    # After the commit, never before it: a rollback cannot delete a file, so a
+    # report written inside the transaction would outlive the rollback and name
+    # paths the database still holds. A report of a migration that did commit
+    # cannot describe anything that is still there.
+    if applied:
+        _write_duplicate_report(db_path, dropped)
     return applied
 
 
-def _migrate_v1(conn: sqlite3.Connection, db_path: Path) -> None:
+def _migrate_v1(conn: sqlite3.Connection, db_path: Path) -> List[str]:
     """
     Create the v1 schema, merging an existing ``local_library`` into it.
 
@@ -170,12 +204,20 @@ def _migrate_v1(conn: sqlite3.Connection, db_path: Path) -> None:
     the natural key; an existing one is deduped and rebuilt. Both end at
     ``user_version = 1``.
 
-    The duplicate report is written last: a report that survived a rolled-back
-    migration would describe rows that are still there.
+    The duplicate report is *not* written here. Rolling back cannot remove a file
+    the way it removes rows, so a report written inside the migration's
+    transaction could survive a failed ``COMMIT`` and describe paths the database
+    still references -- and the one thing an operator does with that file is
+    delete the paths it lists. The dropped paths are returned instead, and
+    :func:`apply_migrations` writes them once the commit has succeeded.
 
     Args:
         conn: Connection with an open write transaction.
-        db_path: Path of the database, for the duplicate report.
+        db_path: Path of the database, kept for the signature every caller and
+            the rollback test rely on.
+
+    Returns:
+        One report line per file path the merge dropped.
     """
     conn.execute(_ARTISTS_DDL)
     conn.execute(_TRACKED_TRACKS_DDL)
@@ -197,7 +239,7 @@ def _migrate_v1(conn: sqlite3.Connection, db_path: Path) -> None:
         conn.execute(statement)
 
     _set_user_version(conn, SCHEMA_VERSION)
-    _write_duplicate_report(db_path, dropped)
+    return dropped
 
 
 def _merge_local_library(
@@ -318,18 +360,23 @@ def _backup_before_migrating(
     return backup_path
 
 
-def _discard_backup(backup_path: Optional[Path]) -> None:
+def _discard_backup(backup_path: Optional[Path], reason: str) -> None:
     """
     Remove a backup that turned out not to be needed, and its WAL sidecar.
 
-    Called when another process migrated while this one was waiting for the
-    lock. That copy was taken before the lock, so it may predate or straddle the
-    other process's transaction; it is not a state anyone should restore from,
-    and keeping it would present it as the pre-migration file. Removing it keeps
-    "one migration, one backup" true.
+    Called on the two paths where a copy exists for a migration that is not
+    going to happen: another process migrated while this one waited for the
+    lock, and the lock could not be taken at all. In both cases the copy was
+    taken before the lock, so it may predate or straddle another process's
+    transaction; it is not a state anyone should restore from, and keeping it
+    would present it as the pre-migration file. Removing it keeps "a backup
+    exists exactly when a migration ran" true.
+
+    Nothing here touches a database descriptor, so it cannot release a lock.
 
     Args:
         backup_path: Backup to remove, or ``None`` when none was taken.
+        reason: Why the copy is not needed, for the log line.
     """
     if backup_path is None:
         return
@@ -345,10 +392,7 @@ def _discard_backup(backup_path: Optional[Path]) -> None:
             f"Could not remove the unnecessary backup {backup_path}: {e}"
         )
         return
-    logger.info(
-        f"Another process migrated the database first; removed the backup "
-        f"{backup_path} that this process no longer needs"
-    )
+    logger.info(f"Removed the backup {backup_path}: {reason}")
 
 
 def _write_duplicate_report(db_path: Path, lines: Iterable[str]) -> Optional[Path]:
@@ -357,6 +401,10 @@ def _write_duplicate_report(db_path: Path, lines: Iterable[str]) -> Optional[Pat
 
     Written only when a path was really dropped, so the absence of the file
     means "nothing was lost" instead of "the migration did not care".
+
+    Called *after* the migration's commit, never inside its transaction: a
+    rollback undoes rows but not files, so a report written first would survive
+    a failed commit and name paths the database still references.
 
     Args:
         db_path: Path of the database the report belongs to.
@@ -374,6 +422,15 @@ def _write_duplicate_report(db_path: Path, lines: Iterable[str]) -> Optional[Pat
             "".join(f"{line}\n" for line in lines), encoding="utf-8"
         )
     except OSError as e:
+        # The report is written after the migration committed, so this failure
+        # cannot undo the merge and a later startup will not rewrite the file.
+        # The paths go into the log for exactly that reason: they are the only
+        # record of what the merge dropped.
+        logger.error(
+            f"Could not write the duplicate report for {db_path}: {e}. "
+            f"The rows it describes are already merged; the dropped paths were: "
+            f"{'; '.join(lines)}"
+        )
         raise DatabaseFileError(db_path, "write the duplicate report for", e) from e
     logger.warning(
         f"Dropped {len(lines)} duplicate file path(s) while migrating {db_path}; "

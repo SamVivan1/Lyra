@@ -1,6 +1,6 @@
 """Migrasi bernomor, kunci natural ``local_library``, dan laporan duplikat.
 
-The tests below pin four separate promises:
+The tests below pin six separate promises:
 
 * an existing database is migrated in place, duplicates merged by the natural
   key ``(artist COLLATE NOCASE, title COLLATE NOCASE)``, with the paths that
@@ -10,9 +10,14 @@ The tests below pin four separate promises:
 * a migration either happens or does not: a failure, including one after part
   of the work is done, leaves the database exactly as it was;
 * the version check is the one that decides, so a second process (or the next
-  startup) skips the work instead of repeating it.
+  startup) skips the work instead of repeating it;
+* a backup exists exactly when a migration ran, including on the path where the
+  write lock could not be taken at all;
+* the duplicate report is written only after the commit that makes its paths
+  really dropped, so it can never describe rows the database still holds.
 """
 
+import logging
 import sqlite3
 import subprocess
 import sys
@@ -323,6 +328,51 @@ def test_failure_after_the_rebuild_leaves_the_legacy_table_untouched(tmp_path, m
     assert not (tmp_path / "migration-duplicates-1.txt").exists()
 
 
+class _CommitFailsConnection:
+    """A real connection whose ``COMMIT`` fails the way a full disk makes it fail.
+
+    Every statement of the migration has already run when this is called, so the
+    rollback that follows puts the merged-away rows back exactly as they were.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, *params):
+        return self._conn.execute(sql, *params)
+
+    def commit(self):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_a_commit_that_fails_leaves_no_report_describing_rows_that_remain(tmp_path):
+    """The report must never name paths the database still references.
+
+    A ``COMMIT`` can fail after every statement has run, and then the rollback
+    puts the duplicate rows back. A report written before the commit would call
+    that rolled-back state "dropped", and the one thing an operator does with
+    this file is delete the paths it lists -- paths the database still points at.
+    So the report is written only after a successful commit.
+    """
+    db = _legacy_db(tmp_path)
+    raw = sqlite3.connect(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            migrations.apply_migrations(_CommitFailsConnection(raw), db)
+    finally:
+        raw.close()
+
+    assert not (tmp_path / "migration-duplicates-1.txt").exists(), (
+        "the report names a duplicate that the rollback put back: its paths are "
+        "still referenced by the database"
+    )
+    assert _user_version(db) == 0
+    assert len(_rows(db)) == 4
+
+
 def test_apply_migrations_reports_the_version_it_ran(tmp_path):
     db = _legacy_db(tmp_path)
     conn = DatabaseConnection(db)
@@ -371,7 +421,7 @@ def test_the_migration_holds_the_write_lock_while_it_runs(tmp_path, monkeypatch)
             capture_output=True, text=True, timeout=60,
         )
         probes.append(result.stdout.strip())
-        real_migrate_v1(conn, db_path)
+        return real_migrate_v1(conn, db_path)
 
     monkeypatch.setattr(migrations, "_migrate_v1", probe_then_migrate)
 
@@ -384,6 +434,55 @@ def test_the_migration_holds_the_write_lock_while_it_runs(tmp_path, monkeypatch)
     # And the migration still did its job under that lock.
     assert _user_version(db) == 1
     assert len(_rows(db)) == 1
+
+
+class _LockedBeginConnection:
+    """A real connection whose ``BEGIN IMMEDIATE`` answers the way a locked peer does.
+
+    ``BEGIN IMMEDIATE`` waits the connection's ``busy_timeout`` and then gives up
+    with ``database is locked``; a stand-in keeps the test instant and hermetic
+    instead of parking a real writer for five seconds.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, *params):
+        if sql.strip().upper().startswith("BEGIN IMMEDIATE"):
+            raise sqlite3.OperationalError("database is locked")
+        return self._conn.execute(sql, *params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_a_begin_that_cannot_take_the_lock_leaves_no_backup(tmp_path, caplog):
+    """A migration that never began must not leave ``db.backup-*`` behind.
+
+    The copy is taken before the lock on purpose, so this is the one path where a
+    backup exists for a migration that never ran. Leaving it there would break
+    what ``db.backup-*`` means -- "a migration ran" -- and present a copy nothing
+    needs as the pre-migration state. The failure itself stays fatal on purpose
+    (and is logged, not silent): an unmigrated schema must not be reported as a
+    migrated one, because the process would then run against the legacy table.
+    """
+    db = _legacy_db(tmp_path)
+    raw = sqlite3.connect(db)
+    try:
+        with caplog.at_level(logging.WARNING, logger="lyra.database.migrations"):
+            with pytest.raises(sqlite3.OperationalError):
+                migrations.apply_migrations(_LockedBeginConnection(raw), db)
+    finally:
+        raw.close()
+
+    assert not list(tmp_path.glob("legacy.db.backup-*")), (
+        "a backup survived a migration that never began, so a backup no longer "
+        "means a migration ran"
+    )
+    assert "lock" in caplog.text.lower(), "the lock failure must not be silent"
+    # No transaction was ever opened, so nothing was written and nothing is stale.
+    assert _user_version(db) == 0
+    assert len(_rows(db)) == 4
 
 
 def test_a_backup_taken_for_a_migration_another_process_ran_is_dropped(tmp_path, monkeypatch):
