@@ -169,25 +169,25 @@ def main() -> int:
         epilog="""
 Examples:
   # Normal operation (fetch recommendations and fallback)
-  python -m lyra.main
+  python -m lyra
   
   # Force rescan music library and then run normally
-  python -m lyra.main --rescan
+  python -m lyra --rescan
   
   # Only add artists from ListenBrainz
-  python -m lyra.main --add-only
+  python -m lyra --add-only
   
   # Only run fallback downloads
-  python -m lyra.main --fallback-only
+  python -m lyra --fallback-only
   
   # Dry run (simulate without actual changes)
-  python -m lyra.main --dry-run
+  python -m lyra --dry-run
   
   # Run continuously every 6 hours
-  python -m lyra.main --loop
+  python -m lyra --loop
 
   # Repair a corrupt database (backs it up, then rebuilds it empty)
-  python -m lyra.main --repair-db
+  python -m lyra --repair-db
         """
     )
 

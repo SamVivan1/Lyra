@@ -14,7 +14,7 @@ The service uses the `Dockerfile` in the repository and loads configuration from
 
 ## Runtime Environment
 
-The Docker image sets `PYTHONPATH=/app/src` so the package can be executed as:
+The Docker image installs the package with `pip install .`, so it can be executed as:
 
 ```bash
 python -m lyra

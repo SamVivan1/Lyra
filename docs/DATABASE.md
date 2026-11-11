@@ -55,23 +55,20 @@ Tracks which artists are being monitored for recommendations.
 
 ```sql
 CREATE TABLE artists (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_checked TIMESTAMP
+    artist_name TEXT PRIMARY KEY,
+    added_at TEXT NOT NULL,
+    recommended_tracks TEXT
 );
-
-CREATE INDEX idx_artists_name ON artists(name);
-CREATE INDEX idx_artists_added_at ON artists(added_at);
 ```
 
 **Columns**:
-- `id`: Primary key, auto-increment
-- `name`: Artist name (unique constraint prevents duplicates)
-- `added_at`: Timestamp when artist was added to tracking
-- `last_checked`: Last time artist was checked for recommendations
+- `artist_name`: Primary key, the artist name (the key itself prevents duplicates)
+- `added_at`: ISO-8601 UTC timestamp when the artist was added to tracking
+- `recommended_tracks`: JSON array of recommended track titles
 
 **Purpose**: Maintains set of artists to monitor
+
+> Migration v2 rebuilds this table to drop the obsolete `fallback_done` column; the shape above is the current one.
 
 ### local_library
 
@@ -272,52 +269,50 @@ Analyze query optimization:
 db.execute("ANALYZE")
 ```
 
-## DatabaseConnection Singleton
+## DatabaseConnection lifecycle
 
-All database operations use the singleton pattern:
+`DatabaseConnection` is a plain object with a two-phase lifecycle — there is no singleton. The constructor only records the path and never touches disk, which is what makes tests hermetic:
 
 ```python
 from lyra.database.connection import DatabaseConnection
 
-# Get or create singleton
-db = DatabaseConnection()
-
-# Use in context manager
-with db.get_connection() as conn:
-    cursor = conn.cursor()
-    result = cursor.execute("SELECT ...")
+db = DatabaseConnection("music_automation.db")   # no I/O
+db.initialize()                                   # mkdir, migrate, WAL + pragmas
 ```
 
-### Thread Safety
+`initialize()` is called once by `main()` before any component is built. It creates the parent directory, applies the schema migrations inside one `BEGIN IMMEDIATE` transaction, then sets `journal_mode=WAL`, `busy_timeout` and `synchronous=NORMAL`.
 
-The DatabaseConnection singleton is thread-safe:
+### Concurrency
+
+WAL allows one writer alongside many readers, and `busy_timeout` makes a competing writer wait instead of failing immediately:
 
 ```python
-# Safe to use from multiple threads
-db = DatabaseConnection()
-
-# Each thread gets its own connection from the pool
+# Each call opens its own connection; it is closed on exit.
 with db.get_connection() as conn:
-    # Connection is thread-local
-    pass
+    ...
 ```
+
+A lock is never treated as corruption: `sqlite3.OperationalError` is re-raised untouched, and only a failing `PRAGMA integrity_check` counts as a damaged file. Repair is explicit (`lyra --repair-db`), never automatic.
 
 ## Migration and Backup
 
 ### Backup Database
 
 ```bash
-cp lyra.db lyra.db.backup
+cp music_automation.db "music_automation.db.backup-$(date +%s)"
 ```
+
+`lyra --repair-db` writes its own backup next to the database before it touches anything, so a manual copy is only needed before an intentional reset.
 
 ### Reset Database
 
-```python
-from lyra.database.connection import DatabaseConnection
+There is no `reset_database()` method. Stop the service, remove the database file **and its WAL sidecars**, and let the next start rebuild the schema:
 
-db = DatabaseConnection()
-db.reset_database()  # Drops all tables and recreates schema
+```bash
+rm -f music_automation.db music_automation.db-wal music_automation.db-shm
 ```
+
+Removing only the main file leaves a stale `-wal` behind, so remove all three together.
 
 ### Export to CSV
 
@@ -325,7 +320,7 @@ db.reset_database()  # Drops all tables and recreates schema
 import csv
 import sqlite3
 
-conn = sqlite3.connect('lyra.db')
+conn = sqlite3.connect('music_automation.db')
 cursor = conn.cursor()
 
 # Export local_library

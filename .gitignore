@@ -16,3 +16,4 @@ htmlcov/
 # Agent review artifacts, never part of the package.
 .review/
 .superpowers/
+*.egg-info/

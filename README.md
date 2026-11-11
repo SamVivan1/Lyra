@@ -22,18 +22,21 @@ The application code lives inside `src/lyra/` and follows a clean architecture w
 
 ## ⚙️ Installation
 
+Dependencies live in `pyproject.toml`; there is no separate requirements file to keep in sync.
+
 ```bash
 git clone https://github.com/your-username/lyra.git
 cd lyra
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
-For development:
+For development (adds pytest, ruff, mypy and coverage tooling):
 
 ```bash
-pip install -e .
+pip install -e ".[dev]"
+pytest
 ```
 
 ## 🧩 Configuration
@@ -88,7 +91,7 @@ Build and start the service:
 docker-compose up -d --build
 ```
 
-The container uses `PYTHONPATH=/app/src` so the package runs from the source tree.
+The image installs the package with `pip install .`, so the container runs the console module directly — there is no `PYTHONPATH` to set.
 
 ## 📚 Documentation
 
