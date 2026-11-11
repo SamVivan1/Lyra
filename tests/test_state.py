@@ -216,3 +216,77 @@ def test_an_insert_that_omits_status_is_visible_to_the_queue(tmp_path):
         c.commit()
 
     assert [t["title"] for t in tm.get_pending_tracked_tracks(hours=0)] == ["B"]
+
+
+def test_a_rescan_refreshes_a_moved_file_path_and_keeps_added_at(tmp_path):
+    """§7.3: the write is an upsert, so a moved file stops pointing at its old path.
+
+    ``INSERT OR IGNORE`` left ``file_path`` stale forever after a rename, which
+    made the library index disagree with the disk. ``added_at`` is the one column
+    the update must not touch: it is the age every cutoff measures.
+    """
+    root_a = tmp_path / "MusicA"
+    root_b = tmp_path / "MusicB"
+    original = root_a / "Artist" / "Album" / "Song.mp3"
+    moved = root_b / "Artist" / "Album" / "Song.mp3"
+    original.parent.mkdir(parents=True)
+    moved.parent.mkdir(parents=True)
+    original.write_bytes(b"\x00")
+
+    conn = DatabaseConnection(tmp_path / "t.db")
+    conn.initialize()
+    assert LibraryScanner(str(root_a), conn).scan_library(force=True) == 1
+    with conn.get_connection() as c:
+        added_at = c.execute("SELECT added_at FROM local_library").fetchone()[0]
+
+    os.replace(original, moved)
+    # Not a forced scan: force clears the cache first, which would hide the very
+    # upsert this test is about behind a delete-and-insert.
+    LibraryScanner(str(root_b), conn).scan_library(force=False)
+
+    with conn.get_connection() as c:
+        rows = c.execute(
+            "SELECT file_path, added_at FROM local_library"
+        ).fetchall()
+    assert len(rows) == 1, "the same track is one row, whatever its path"
+    assert rows[0]["file_path"] == str(moved)
+    assert rows[0]["added_at"] == added_at, "a rescan must not reset a track's age"
+
+
+def test_the_upsert_fills_a_null_album_and_keeps_what_the_row_already_has(tmp_path):
+    """Only the columns §7.3 names are refreshed, and never with a NULL.
+
+    A scan that cannot read tags must not erase an album an earlier scan found,
+    and the MBID is an attribute the row already carries -- a later scan that
+    does not know it must not blank it.
+    """
+    conn = DatabaseConnection(tmp_path / "t.db")
+    conn.initialize()
+    state = StateManager(db_connection=conn)
+
+    assert state.add_local_track(
+        "A", "B", file_path="/old.mp3", added_at="2026-01-01T00:00:00+00:00"
+    ) is True
+    assert state.add_local_track(
+        "a", "b", album="Album", file_path="/new.mp3",
+        recording_mbid="mbid-1", added_at="2026-02-02T00:00:00+00:00",
+    ) is False, "an existing row is refreshed, not inserted"
+
+    with conn.get_connection() as c:
+        row = c.execute(
+            "SELECT artist, album, file_path, recording_mbid, added_at"
+            " FROM local_library"
+        ).fetchone()
+    assert tuple(row) == (
+        "A", "Album", "/new.mp3", "mbid-1", "2026-01-01T00:00:00+00:00"
+    )
+
+    # A later scan that knows no album and no MBID must not blank either.
+    assert state.add_local_track("A", "B", file_path="/newer.mp3") is False
+    with conn.get_connection() as c:
+        row = c.execute(
+            "SELECT album, file_path, recording_mbid, added_at FROM local_library"
+        ).fetchone()
+    assert tuple(row) == (
+        "Album", "/newer.mp3", "mbid-1", "2026-01-01T00:00:00+00:00"
+    )

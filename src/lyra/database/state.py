@@ -61,8 +61,30 @@ class StateManager:
         added_at: Optional[str] = None
     ) -> bool:
         """
-        Add a track to the local library cache.
-        
+        Record a track in the local library cache, refreshing an existing row.
+
+        This is an upsert on the natural key the schema keeps,
+        ``(artist COLLATE NOCASE, title COLLATE NOCASE)`` (design §7.3). The
+        previous ``INSERT OR IGNORE`` never rewrote a row, so a file that was
+        moved or renamed kept its old ``file_path`` forever, and an ``album``
+        that was NULL at the first scan stayed NULL forever.
+
+        What the conflict update refreshes, and what it must not:
+
+        * ``file_path`` follows the new scan, which is the whole point: the row
+          has to point at where the file is now.
+        * ``album`` is only filled in when the new scan knows one, so a scan that
+          could not read tags does not erase what an earlier one found.
+        * ``recording_mbid`` is kept when the row already has one and filled from
+          the new scan otherwise (it is an attribute, not part of the key).
+        * ``added_at`` is deliberately *not* touched. It is the age every
+          age-based cutoff measures, so rewriting it on every rescan would make
+          a track perpetually young and reset its waiting time.
+
+        The conflict target repeats the index's collations, because a target has
+        to name that index; ``COLLATE NOCASE`` is what makes ``Artist`` and
+        ``artist`` the same row here, exactly as it does in the index.
+
         Args:
             artist: Artist name
             title: Track title
@@ -70,9 +92,10 @@ class StateManager:
             recording_mbid: MusicBrainz recording ID (optional)
             file_path: Full path to audio file (optional)
             added_at: Timestamp in ISO format (optional, defaults to now)
-            
+
         Returns:
-            True if successfully added, False if already exists
+            True if a new row was inserted, False if an existing row was
+            refreshed (or the write failed)
         """
         if self.dry_run:
             logger.info(f"[DRY RUN] Not adding local track '{artist} - {title}'")
@@ -82,13 +105,30 @@ class StateManager:
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
                 now = added_at or self._now_iso()
+                # This read exists only for the return value: the row's identity
+                # is the unique index's job, and the upsert below is what makes
+                # the write idempotent. RETURNING would report which branch ran
+                # without it, but that needs SQLite 3.35+, which is newer than
+                # the floor this project's migrations deliberately respect.
+                already_present = cursor.execute('''
+                    SELECT 1 FROM local_library
+                    WHERE artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE
+                    LIMIT 1
+                ''', (artist, title)).fetchone() is not None
                 cursor.execute('''
-                    INSERT OR IGNORE INTO local_library 
-                    (artist, album, title, recording_mbid, file_path, added_at)
+                    INSERT INTO local_library
+                        (artist, album, title, recording_mbid, file_path, added_at)
                     VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(artist COLLATE NOCASE, title COLLATE NOCASE)
+                    DO UPDATE SET
+                        file_path = excluded.file_path,
+                        album = COALESCE(excluded.album, local_library.album),
+                        recording_mbid = COALESCE(
+                            local_library.recording_mbid, excluded.recording_mbid
+                        )
                 ''', (artist, album, title, recording_mbid, file_path, now))
                 conn.commit()
-                return cursor.rowcount > 0
+                return not already_present
         except sqlite3.Error as e:
             logger.error(f"Failed to add local track '{artist} - {title}': {e}")
             return False
