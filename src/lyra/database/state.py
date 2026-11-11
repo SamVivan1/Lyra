@@ -8,7 +8,7 @@ import logging
 import sqlite3
 import json
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import List, Optional
 
 from .connection import DatabaseConnection
 
@@ -184,8 +184,8 @@ class StateManager:
                 tracks_json = json.dumps(recommended_tracks or [])
                 cursor.execute('''
                     INSERT OR IGNORE INTO artists 
-                    (artist_name, added_at, fallback_done, recommended_tracks)
-                    VALUES (?, ?, 0, ?)
+                    (artist_name, added_at, recommended_tracks)
+                    VALUES (?, ?, ?)
                 ''', (artist_name, now, tracks_json))
                 conn.commit()
                 return cursor.rowcount > 0
@@ -208,79 +208,6 @@ class StateManager:
         except sqlite3.Error as e:
             logger.error(f"Failed to get tracked artists: {e}")
             return []
-
-    def get_pending_fallback_artists(
-        self,
-        hours: int = 24
-    ) -> List[Dict[str, Any]]:
-        """
-        Get artists pending fallback (older than specified hours).
-        
-        Args:
-            hours: Hours threshold (default: 24)
-            
-        Returns:
-            List of artist dictionaries with name and recommended_tracks
-        """
-        pending_artists: List[Dict[str, Any]] = []
-        try:
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT artist_name, added_at, recommended_tracks 
-                    FROM artists 
-                    WHERE fallback_done = 0
-                ''')
-                rows = cursor.fetchall()
-                
-                now = datetime.now(timezone.utc)
-                for artist_name, added_at_str, recommended_tracks_json in rows:
-                    try:
-                        added_at = datetime.fromisoformat(added_at_str)
-                        if added_at.tzinfo is None:
-                            added_at = added_at.replace(tzinfo=timezone.utc)
-                        
-                        delta = now - added_at
-                        if delta.total_seconds() > hours * 3600:
-                            try:
-                                tracks = json.loads(recommended_tracks_json) if recommended_tracks_json else []
-                            except json.JSONDecodeError:
-                                tracks = []
-                            
-                            pending_artists.append({
-                                "name": artist_name,
-                                "recommended_tracks": tracks
-                            })
-                    except ValueError as e:
-                        logger.error(f"Error parsing timestamp for artist '{artist_name}': {e}")
-                
-                return pending_artists
-        except sqlite3.Error as e:
-            logger.error(f"Failed to get pending fallback artists: {e}")
-            return []
-
-    def mark_fallback_done(self, artist_name: str) -> bool:
-        """
-        Mark an artist's fallback as completed.
-        
-        Args:
-            artist_name: Name of artist
-            
-        Returns:
-            True if successfully updated
-        """
-        try:
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE artists SET fallback_done = 1 WHERE artist_name = ?",
-                    (artist_name,)
-                )
-                conn.commit()
-                return cursor.rowcount > 0
-        except sqlite3.Error as e:
-            logger.error(f"Failed to mark fallback done for '{artist_name}': {e}")
-            return False
 
     def ensure_library_indexed(self, force_rescan: bool = False) -> None:
         """

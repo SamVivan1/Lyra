@@ -138,7 +138,7 @@ CREATE TABLE tracked_tracks (
 
 **StateManager** (`state.py`):
 - High-level library operations (add_local_track, track_exists, clear_local_library)
-- Artist tracking (add_artist, get_tracked_artists, get_pending_fallback_artists)
+- Artist tracking (add_artist, get_tracked_artists)
 - Library indexing with force-rescan support
 
 **TrackStateManager** (`track_manager.py`):

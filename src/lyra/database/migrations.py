@@ -33,6 +33,14 @@ directory scan, is always -- and no constraint could be dropped in place, so the
 existing table is rebuilt. SQLite cannot express "this row is the survivor", so
 the merge rules are applied in Python, with SQLite's own ``COLLATE NOCASE``
 semantics (ASCII-only case folding) applied explicitly.
+
+Migration v2 gives ``tracked_tracks`` the columns the retry state machine needs
+(``attempts``, ``last_attempt_at``, ``next_retry_at``, ``last_error``,
+``lidarr_checked_at``), renames the legacy ``PENDING`` status to ``NEW``, merges
+the rows that share the natural key, and puts the unique index on that key. It
+also rebuilds ``artists`` without ``fallback_done``: no code in this branch ever
+set it, and ``ALTER TABLE ... DROP COLUMN`` would need a newer SQLite than the
+oldest interpreter in the CI matrix ships.
 """
 
 import logging
@@ -45,17 +53,23 @@ from .errors import DatabaseFileError
 logger = logging.getLogger(__name__)
 
 #: Current schema version. Bump this and add ``_migrate_v<n>`` together.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-#: Report written next to the database when v1 drops rows that held their own
-#: copy of the file. Audio files themselves are never touched by a migration.
-DUPLICATE_REPORT_NAME = "migration-duplicates-1.txt"
+#: Report written next to the database for the rows a migration drops. One file
+#: per version, so v1's list of dropped audio file paths is not overwritten by
+#: v2's list of dropped duplicate tracks: an operator acting on a report must
+#: never be reading another migration's findings. Audio files themselves are
+#: never touched by a migration.
+DUPLICATE_REPORT_TEMPLATE = "migration-duplicates-{version}.txt"
 
 #: Columns of ``local_library``, in the order every statement here expects.
 _LOCAL_LIBRARY_COLUMNS = "id, artist, album, title, recording_mbid, file_path, added_at"
 
 #: Name of the v1 unique index on the natural key.
 NATURAL_KEY_INDEX = "ux_local_library_natural"
+
+#: Name of the v2 unique index on the natural key of ``tracked_tracks``.
+TRACKED_NATURAL_KEY_INDEX = "ux_tracked_natural"
 
 #: The v1 table. No unique constraint: NULL mbids made it useless, and a table
 #: constraint cannot be dropped without rebuilding the table.
@@ -80,6 +94,10 @@ _ARTISTS_DDL = """
     )
 """
 
+#: The v1 table, kept exactly as v1 released it: v2 adds its columns to this
+#: shape instead of editing it. The ``status`` default is the legacy queue head
+#: and is only reachable by an INSERT that names no status -- every writer in
+#: this branch names ``NEW`` explicitly.
 _TRACKED_TRACKS_DDL = """
     CREATE TABLE IF NOT EXISTS tracked_tracks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +124,55 @@ _LOCAL_LIBRARY_INDEXES = (
 _TRACKED_TRACKS_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_tracked_tracks_status ON tracked_tracks(status)",
 )
+
+#: The v2 state-machine columns of ``tracked_tracks``, as ``(name, definition)``.
+#: Every one is nullable or defaulted: a NOT NULL column cannot be added without
+#: a default, and a legacy row genuinely has no attempt history to carry. Those
+#: defaults *are* the reset a migrated row needs -- ``attempts`` 0 because no
+#: attempt was ever counted, ``next_retry_at`` NULL because no retry has been
+#: scheduled yet.
+_TRACKED_TRACK_STATE_COLUMNS = (
+    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_attempt_at", "TEXT"),
+    ("next_retry_at", "TEXT"),
+    ("last_error", "TEXT"),
+    ("lidarr_checked_at", "TEXT"),
+)
+
+#: The v2 indexes: the natural key (which makes the insert idempotent) and the
+#: queue lookup the retry worker reads with ``ORDER BY next_retry_at``.
+_TRACKED_TRACK_V2_INDEXES = (
+    f"CREATE UNIQUE INDEX IF NOT EXISTS {TRACKED_NATURAL_KEY_INDEX} "
+    "ON tracked_tracks(artist COLLATE NOCASE, title COLLATE NOCASE)",
+    "CREATE INDEX IF NOT EXISTS ix_tracked_queue "
+    "ON tracked_tracks(status, next_retry_at)",
+)
+
+#: The v2 table. No ``fallback_done``: this branch never reads or writes it, and
+#: dropping it by rebuilding is the only way that works on every SQLite version
+#: this project supports.
+_ARTISTS_V2_DDL = """
+    CREATE TABLE {table} (
+        artist_name TEXT PRIMARY KEY,
+        added_at TEXT NOT NULL,
+        recommended_tracks TEXT
+    )
+"""
+
+#: Merge precedence for duplicate ``tracked_tracks`` rows, strongest first. A
+#: track that completed is not reopened by a duplicate that is still queued, so
+#: the status decides before the id does.
+_STATUS_PRECEDENCE = (
+    "COMPLETED",
+    "RUNNING",
+    "QUEUED_FALLBACK",
+    "WAITING_LIDARR",
+    "NEW",
+    "FAILED",
+    "DEAD",
+)
+
+_STATUS_RANK = {status: rank for rank, status in enumerate(_STATUS_PRECEDENCE)}
 
 #: ASCII-only lower casing, the exact folding ``COLLATE NOCASE`` performs. str.lower()
 #: would fold non-ASCII too and split a group the unique index considers one row.
@@ -155,7 +222,7 @@ def apply_migrations(
     backup_path = _backup_before_migrating(conn, db_path)
 
     applied: List[int] = []
-    dropped: List[str] = []
+    dropped: dict[int, List[str]] = {}
     try:
         conn.execute("BEGIN IMMEDIATE")
     except BaseException as e:
@@ -181,18 +248,25 @@ def apply_migrations(
             conn.commit()
             return []
         if version < 1:
-            dropped = _migrate_v1(conn, db_path)
+            dropped[1] = _migrate_v1(conn, db_path)
             applied.append(1)
+        if version < 2:
+            dropped[2] = _migrate_v2(conn, db_path)
+            applied.append(2)
         conn.commit()
     except BaseException:
         conn.rollback()
         raise
     # After the commit, never before it: a rollback cannot delete a file, so a
     # report written inside the transaction would outlive the rollback and name
-    # paths the database still holds. A report of a migration that did commit
-    # cannot describe anything that is still there.
-    if applied:
-        _write_duplicate_report(db_path, dropped)
+    # rows and paths the database still holds. A report of a migration that did
+    # commit cannot describe anything that is still there. Each version writes
+    # its own file, so a v2 merge never overwrites v1's dropped paths -- an
+    # operator acts on the file a specific migration produced.
+    for applied_version in applied:
+        _write_duplicate_report(
+            db_path, applied_version, dropped.get(applied_version, [])
+        )
     return applied
 
 
@@ -238,8 +312,136 @@ def _migrate_v1(conn: sqlite3.Connection, db_path: Path) -> List[str]:
     for statement in _LOCAL_LIBRARY_INDEXES + _TRACKED_TRACKS_INDEXES:
         conn.execute(statement)
 
-    _set_user_version(conn, SCHEMA_VERSION)
+    # The version this step reaches, not :data:`SCHEMA_VERSION`: a migration knows
+    # the shape it builds, and v2 must be able to add its columns on top of it.
+    _set_user_version(conn, 1)
     return dropped
+
+
+def _migrate_v2(conn: sqlite3.Connection, db_path: Path) -> List[str]:
+    """
+    Give ``tracked_tracks`` the state-machine columns, then merge its duplicates.
+
+    Order matters in both directions: the legacy status is renamed *before* the
+    merge, because the merge ranks rows by status and ``PENDING`` is the old name
+    of the queue head; and the unique index is created *after* it, because the
+    merge is what makes the index creatable.
+
+    The columns are added with ``ALTER TABLE ... ADD COLUMN`` rather than by
+    rebuilding the table: the table-level ``UNIQUE(recording_mbid, artist, title)``
+    that v1 left behind keeps working, and the natural-key index makes the insert
+    idempotent on its own. The column defaults are the reset a migrated row
+    needs: no attempt has ever been counted ("attempts = 0") and no retry has
+    been scheduled ("next_retry_at = NULL"), which is true by construction
+    because neither column existed before this migration.
+
+    Args:
+        conn: Connection with an open write transaction.
+        db_path: Path of the database, kept for the signature every caller and
+            the rollback test rely on.
+
+    Returns:
+        One report line per duplicate row the merge dropped.
+    """
+    conn.execute("UPDATE tracked_tracks SET status = 'NEW' WHERE status = 'PENDING'")
+
+    for name, definition in _TRACKED_TRACK_STATE_COLUMNS:
+        conn.execute(f"ALTER TABLE tracked_tracks ADD COLUMN {name} {definition}")
+
+    dropped = _merge_tracked_tracks(conn)
+
+    for statement in _TRACKED_TRACK_V2_INDEXES:
+        conn.execute(statement)
+
+    _rebuild_artists(conn)
+
+    _set_user_version(conn, 2)
+    return dropped
+
+
+def _merge_tracked_tracks(conn: sqlite3.Connection) -> List[str]:
+    """
+    Merge ``tracked_tracks`` rows that share the natural key, keeping the best one.
+
+    Winner: the highest-precedence status, then the lowest id. The status decides
+    first on purpose -- a track that already completed must not be reopened by a
+    duplicate that is still queued. Two merge rules, and only these:
+    ``attempts`` is the maximum over the merged rows (retry history is the one
+    column where a losing row holds the better value, and forgetting it would give
+    a track extra tries it already spent), and ``last_error`` follows the winner,
+    so the error on record describes the state the track is really in.
+
+    Rows are merged in Python for the same reason v1 merges ``local_library`` in
+    Python: SQLite cannot express "this row is the survivor", and the grouping
+    must use the ASCII-only folding ``COLLATE NOCASE`` performs.
+
+    Args:
+        conn: Connection with an open write transaction.
+
+    Returns:
+        One report line (``id, artist, title``) per dropped row, in id order.
+    """
+    rows = conn.execute(
+        "SELECT id, artist, title, status, attempts, last_error FROM tracked_tracks "
+        "ORDER BY id"
+    ).fetchall()
+
+    groups: dict[tuple[str, str], list[tuple]] = {}
+    for row in rows:
+        row = tuple(row)
+        groups.setdefault((_fold(row[1]), _fold(row[2])), []).append(row)
+
+    dropped: List[str] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        winner = min(members, key=lambda row: (_status_rank(row[3]), row[0]))
+        attempts = max(int(row[4] or 0) for row in members)
+        conn.execute(
+            "UPDATE tracked_tracks SET attempts = ? WHERE id = ?",
+            (attempts, winner[0]),
+        )
+        losers = [row for row in members if row[0] != winner[0]]
+        for row in losers:
+            dropped.append(f"{row[0]}\t{row[1]}\t{row[2]}")
+        conn.executemany(
+            "DELETE FROM tracked_tracks WHERE id = ?", [(row[0],) for row in losers]
+        )
+    if dropped:
+        logger.warning(
+            f"Merged {len(dropped)} duplicate tracked_tracks row(s) using the "
+            "natural key artist + title"
+        )
+    return dropped
+
+
+def _rebuild_artists(conn: sqlite3.Connection) -> None:
+    """
+    Recreate ``artists`` without ``fallback_done``, keeping every row.
+
+    ``ALTER TABLE ... DROP COLUMN`` needs SQLite 3.35 or newer and the CI matrix
+    includes interpreters that link an older system SQLite, so the column is
+    dropped the way v1 drops a table constraint: build the new table, copy the
+    rows, drop the old one, rename. ``artist_name`` is the primary key, so the
+    copy keeps the table's identity as well as its rows.
+
+    Args:
+        conn: Connection with an open write transaction.
+    """
+    if not _table_exists(conn, "artists"):
+        conn.execute(_ARTISTS_V2_DDL.format(table="artists"))
+        return
+    if "fallback_done" not in _column_names(conn, "artists"):
+        logger.debug("artists is already in its v2 shape")
+        return
+    conn.execute("DROP TABLE IF EXISTS artists_v2")
+    conn.execute(_ARTISTS_V2_DDL.format(table="artists_v2"))
+    conn.execute(
+        "INSERT INTO artists_v2 (artist_name, added_at, recommended_tracks) "
+        "SELECT artist_name, added_at, recommended_tracks FROM artists"
+    )
+    conn.execute("DROP TABLE artists")
+    conn.execute("ALTER TABLE artists_v2 RENAME TO artists")
 
 
 def _merge_local_library(
@@ -395,12 +597,17 @@ def _discard_backup(backup_path: Optional[Path], reason: str) -> None:
     logger.info(f"Removed the backup {backup_path}: {reason}")
 
 
-def _write_duplicate_report(db_path: Path, lines: Iterable[str]) -> Optional[Path]:
+def _write_duplicate_report(
+    db_path: Path, version: int, lines: Iterable[str]
+) -> Optional[Path]:
     """
-    Write the dropped-file-path report next to the database.
+    Write the report for the rows ``version`` dropped, next to the database.
 
-    Written only when a path was really dropped, so the absence of the file
-    means "nothing was lost" instead of "the migration did not care".
+    Written only when something was really dropped, so the absence of a file
+    means "nothing was lost" instead of "the migration did not care". Each
+    version writes its own file (``migration-duplicates-<version>.txt``): the two
+    migrations drop different things -- v1 file paths, v2 duplicate tracks -- and
+    one report must never overwrite the other's findings.
 
     Called *after* the migration's commit, never inside its transaction: a
     rollback undoes rows but not files, so a report written first would survive
@@ -408,7 +615,8 @@ def _write_duplicate_report(db_path: Path, lines: Iterable[str]) -> Optional[Pat
 
     Args:
         db_path: Path of the database the report belongs to.
-        lines: Report lines, one per dropped path.
+        version: Schema version of the migration that dropped the rows.
+        lines: Report lines, one per dropped row or path.
 
     Returns:
         The report path, or ``None`` when there was nothing to report.
@@ -416,7 +624,7 @@ def _write_duplicate_report(db_path: Path, lines: Iterable[str]) -> Optional[Pat
     lines = list(lines)
     if not lines:
         return None
-    report_path = Path(db_path).parent / DUPLICATE_REPORT_NAME
+    report_path = _duplicate_report_path(db_path, version)
     try:
         report_path.write_text(
             "".join(f"{line}\n" for line in lines), encoding="utf-8"
@@ -428,20 +636,36 @@ def _write_duplicate_report(db_path: Path, lines: Iterable[str]) -> Optional[Pat
         # record of what the merge dropped.
         logger.error(
             f"Could not write the duplicate report for {db_path}: {e}. "
-            f"The rows it describes are already merged; the dropped paths were: "
+            f"The rows it describes are already merged; the dropped rows were: "
             f"{'; '.join(lines)}"
         )
         raise DatabaseFileError(db_path, "write the duplicate report for", e) from e
     logger.warning(
-        f"Dropped {len(lines)} duplicate file path(s) while migrating {db_path}; "
-        f"they are listed in {report_path}. The audio files themselves are untouched."
+        f"Dropped {len(lines)} row(s) while migrating {db_path}; "
+        f"they are listed in {report_path}."
     )
     return report_path
+
+
+def _duplicate_report_path(db_path: Union[str, Path], version: int) -> Path:
+    """Return the report path for ``version``, in ``db_path``'s directory."""
+    return Path(db_path).parent / DUPLICATE_REPORT_TEMPLATE.format(version=int(version))
 
 
 def _fold(value: str) -> str:
     """Fold ``value`` the way ``COLLATE NOCASE`` does: ASCII letters only."""
     return value.translate(_ASCII_LOWER)
+
+
+def _status_rank(status: Optional[str]) -> int:
+    """
+    Rank a ``tracked_tracks`` status for the merge: lower wins.
+
+    A status this schema does not know loses to every one it does, and is then
+    decided by id alone -- it is not treated as the strongest, because an
+    unrecognised value says nothing about how far the track got.
+    """
+    return _STATUS_RANK.get(status or "", len(_STATUS_PRECEDENCE))
 
 
 def _user_version(conn: sqlite3.Connection) -> int:
@@ -463,6 +687,11 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return the column names of ``table``."""
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def _local_library_is_v1(conn: sqlite3.Connection) -> bool:

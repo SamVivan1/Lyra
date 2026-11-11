@@ -91,3 +91,72 @@ def test_get_pending_tracked_tracks_returns_overdue(tmp_path):
     assert len(pending) == 1
     assert pending[0]["artist"] == "Artist"
     assert pending[0]["title"] == "Old Title"
+
+
+def test_add_tracked_track_is_idempotent(tmp_path):
+    """Duplicate detection is the insert's job, not a separate read-then-write."""
+    conn = DatabaseConnection(tmp_path / "t.db")
+    conn.initialize()
+    tm = TrackStateManager(conn)
+    assert tm.add_tracked_track(None, "A", "B") is True
+    assert tm.add_tracked_track(None, "A", "B") is False
+    with conn.get_connection() as c:
+        assert c.execute("SELECT COUNT(*) FROM tracked_tracks").fetchone()[0] == 1
+
+
+def test_add_artist_works_without_the_fallback_done_column(tmp_path):
+    """The column is gone, so nothing may name it in an INSERT or a WHERE."""
+    conn = DatabaseConnection(tmp_path / "t.db")
+    conn.initialize()
+    state = StateManager(db_connection=conn)
+
+    assert state.add_artist("Autechre", ["Amber"]) is True
+    assert state.add_artist("Autechre", ["Amber"]) is False
+    assert state.get_tracked_artists() == ["Autechre"]
+
+
+def test_a_legacy_pending_track_is_queued_as_new(tmp_path):
+    """A migrated ``PENDING`` row must still be found by the fallback queue.
+
+    The mapping alone is not enough: if the queue kept asking for ``PENDING``
+    while every writer says ``NEW``, the row the migration just rescued would be
+    invisible and the track would never be downloaded.
+    """
+    db_path = tmp_path / "legacy.db"
+    c = sqlite3.connect(db_path)
+    c.executescript("""
+    CREATE TABLE tracked_tracks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, recording_mbid TEXT, artist TEXT NOT NULL,
+        title TEXT NOT NULL, source TEXT DEFAULT 'listenbrainz', status TEXT DEFAULT 'PENDING',
+        added_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(recording_mbid, artist, title));
+    """)
+    c.execute("INSERT INTO tracked_tracks (artist,title,status,added_at,updated_at)"
+              " VALUES ('Legacy Artist','Legacy Song','PENDING',?,?)",
+              ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00"))
+    c.commit()
+    c.close()
+
+    conn = DatabaseConnection(db_path)
+    conn.initialize()
+    pending = TrackStateManager(conn).get_pending_tracked_tracks(hours=0)
+
+    assert [t["artist"] for t in pending] == ["Legacy Artist"]
+    assert [t["title"] for t in pending] == ["Legacy Song"]
+
+
+def test_a_shared_mbid_does_not_make_two_tracks_the_same(tmp_path):
+    """Identity is the natural key (artist + title); the MBID is an attribute.
+
+    The old pre-check returned "already tracked" for any row carrying the same
+    ``recording_mbid``, whatever artist and title it had. The unique index only
+    judges artist + title, so the insert is the one thing that decides.
+    """
+    conn = DatabaseConnection(tmp_path / "t.db")
+    conn.initialize()
+    tm = TrackStateManager(conn)
+
+    assert tm.add_tracked_track("mbid-1", "A", "B") is True
+    assert tm.add_tracked_track("mbid-1", "A", "Other Title") is True
+    with conn.get_connection() as c:
+        assert c.execute("SELECT COUNT(*) FROM tracked_tracks").fetchone()[0] == 2

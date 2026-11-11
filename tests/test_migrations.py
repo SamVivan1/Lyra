@@ -161,7 +161,7 @@ def test_two_processes_migrate_only_once(tmp_path):
     errs = [p.communicate()[1] for p in procs]
     assert [p.returncode for p in procs] == [0, 0], errs
     c = sqlite3.connect(db)
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 2
     assert c.execute("SELECT COUNT(*) FROM local_library").fetchone()[0] == 1
     c.close()
 
@@ -252,12 +252,12 @@ def test_a_legacy_database_without_duplicates_gets_no_report(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_fresh_database_is_created_at_version_1_with_the_natural_key(tmp_path):
+def test_fresh_database_is_created_at_the_current_version_with_the_natural_key(tmp_path):
     db = tmp_path / "fresh.db"
     conn = DatabaseConnection(db)
     conn.initialize()
 
-    assert _user_version(db) == 1
+    assert _user_version(db) == migrations.SCHEMA_VERSION == 2
     # The natural key is the unique index, not a table constraint that cannot see
     # case differences or distinguish two NULL mbids from each other.
     assert "UNIQUE(artist, title, recording_mbid)" not in _table_sql(db, "local_library")
@@ -268,6 +268,7 @@ def test_fresh_database_is_created_at_version_1_with_the_natural_key(tmp_path):
         ).fetchone()
     # Nothing to dedupe, so no report -- and no backup of an empty file.
     assert not (tmp_path / "migration-duplicates-1.txt").exists()
+    assert not (tmp_path / "migration-duplicates-2.txt").exists()
     assert not list(tmp_path.glob("fresh.db.backup-*"))
 
 
@@ -282,7 +283,7 @@ def test_already_current_database_is_neither_backed_up_nor_migrated(tmp_path):
     conn.initialize()  # a second start, with the schema already at v1
 
     assert not list(tmp_path.glob("t.db.backup-*"))
-    assert _user_version(db) == 1
+    assert _user_version(db) == 2
     assert len(_rows(db)) == 1
 
 
@@ -377,7 +378,7 @@ def test_apply_migrations_reports_the_version_it_ran(tmp_path):
     db = _legacy_db(tmp_path)
     conn = DatabaseConnection(db)
     with conn.get_connection() as c:
-        assert migrations.apply_migrations(c, db) == [1]
+        assert migrations.apply_migrations(c, db) == [1, 2]
         assert migrations.apply_migrations(c, db) == []
 
 
@@ -432,7 +433,7 @@ def test_the_migration_holds_the_write_lock_while_it_runs(tmp_path, monkeypatch)
         "was running, so the version check no longer serializes migrations"
     )
     # And the migration still did its job under that lock.
-    assert _user_version(db) == 1
+    assert _user_version(db) == 2
     assert len(_rows(db)) == 1
 
 
@@ -514,7 +515,7 @@ def test_a_backup_taken_for_a_migration_another_process_ran_is_dropped(tmp_path,
     with DatabaseConnection(db).get_connection() as conn:
         assert migrations.apply_migrations(conn, db) == []
 
-    assert _user_version(db) == 1
+    assert _user_version(db) == 2
     assert len(_rows(db)) == 1
     loser_copy, winner_copy = copies
     assert not loser_copy.exists(), (
@@ -522,3 +523,385 @@ def test_a_backup_taken_for_a_migration_another_process_ran_is_dropped(tmp_path,
     )
     assert winner_copy.exists(), "the one migration that ran lost its backup"
     assert len(list(tmp_path.glob("legacy.db.backup-*"))) == 1
+
+
+# --------------------------------------------------------------------------
+# Migration v2: the tracked_tracks state machine, the legacy status mapping,
+# and the merge of rows that share the natural key.
+#
+# The helper below builds a database in exactly the v1 shape this branch
+# released (``user_version = 1``), so the v1 -> v2 step is tested as an operator
+# would meet it. Building it by hand also keeps the test independent of the code
+# under test: a broken v1 could not quietly define its own fixture.
+# --------------------------------------------------------------------------
+
+V1 = """
+CREATE TABLE artists (
+    artist_name TEXT PRIMARY KEY, added_at TEXT NOT NULL,
+    fallback_done INTEGER DEFAULT 0, recommended_tracks TEXT);
+CREATE TABLE tracked_tracks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, recording_mbid TEXT,
+    artist TEXT NOT NULL, title TEXT NOT NULL,
+    source TEXT DEFAULT 'listenbrainz', status TEXT DEFAULT 'PENDING',
+    added_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(recording_mbid, artist, title));
+CREATE TABLE local_library (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, artist TEXT NOT NULL, album TEXT,
+    title TEXT NOT NULL, recording_mbid TEXT, file_path TEXT, added_at TEXT NOT NULL);
+CREATE UNIQUE INDEX ux_local_library_natural
+    ON local_library(artist COLLATE NOCASE, title COLLATE NOCASE);
+CREATE INDEX idx_local_library_artist ON local_library(artist);
+CREATE INDEX idx_local_library_mbid ON local_library(recording_mbid);
+CREATE INDEX idx_tracked_tracks_status ON tracked_tracks(status);
+PRAGMA user_version = 1;
+"""
+
+#: The columns migration v2 adds to ``tracked_tracks``.
+TRACKED_STATE_COLUMNS = (
+    "attempts",
+    "last_attempt_at",
+    "next_retry_at",
+    "last_error",
+    "lidarr_checked_at",
+)
+
+#: The merge precedence, strongest first. A row with an earlier status wins.
+STATUS_PRECEDENCE = (
+    "COMPLETED",
+    "RUNNING",
+    "QUEUED_FALLBACK",
+    "WAITING_LIDARR",
+    "NEW",
+    "FAILED",
+    "DEAD",
+)
+
+
+def _v1_db(tmp_path, name="v1.db"):
+    db = tmp_path / name
+    c = sqlite3.connect(db)
+    c.executescript(V1)   # executescript hanya untuk MENYIAPKAN data uji
+    c.commit()
+    c.close()
+    return db
+
+
+def _track(db, rows):
+    """Insert ``(artist, title, status, recording_mbid)`` rows into tracked_tracks."""
+    c = sqlite3.connect(db)
+    c.executemany(
+        "INSERT INTO tracked_tracks (recording_mbid, artist, title, status,"
+        " added_at, updated_at) VALUES (?,?,?,?,?,?)",
+        [(mbid, artist, title, status, NOW, NOW) for artist, title, status, mbid in rows],
+    )
+    c.commit()
+    c.close()
+    return db
+
+
+def _tracked_rows(db):
+    c = sqlite3.connect(db)
+    try:
+        return c.execute(
+            "SELECT id, recording_mbid, artist, title, status, attempts, last_error"
+            " FROM tracked_tracks ORDER BY id"
+        ).fetchall()
+    finally:
+        c.close()
+
+
+def _tracked_count(db):
+    c = sqlite3.connect(db)
+    try:
+        return c.execute("SELECT COUNT(*) FROM tracked_tracks").fetchone()[0]
+    finally:
+        c.close()
+
+
+def _columns(db, table):
+    c = sqlite3.connect(db)
+    try:
+        return {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
+    finally:
+        c.close()
+
+
+def _snapshot(db):
+    """Everything a second v2 run must not change, as plain tuples."""
+    c = sqlite3.connect(db)
+    try:
+        tracked = c.execute(
+            "SELECT id, recording_mbid, artist, title, source, status, attempts,"
+            " last_attempt_at, next_retry_at, last_error, lidarr_checked_at,"
+            " added_at, updated_at FROM tracked_tracks ORDER BY id"
+        ).fetchall()
+        artists = c.execute("SELECT * FROM artists ORDER BY artist_name").fetchall()
+        return tracked, artists
+    finally:
+        c.close()
+
+
+def test_legacy_pending_status_becomes_new(tmp_path):
+    """PENDING is the legacy name of the queue head; COMPLETED keeps its meaning.
+
+    Two identical PENDING rows are inserted on purpose: ``COUNT(*)`` is asserted
+    here because a ``dict(artist -> status)`` would collapse them and pass even
+    if the merge never ran.
+    """
+    db = tmp_path / "legacy2.db"
+    c = sqlite3.connect(db)
+    c.executescript("""
+    CREATE TABLE tracked_tracks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, recording_mbid TEXT, artist TEXT NOT NULL,
+        title TEXT NOT NULL, source TEXT DEFAULT 'listenbrainz', status TEXT DEFAULT 'PENDING',
+        added_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(recording_mbid, artist, title));
+    """)
+    for _ in range(2):
+        c.execute("INSERT INTO tracked_tracks (artist,title,status,added_at,updated_at)"
+                  " VALUES ('A','B','PENDING','x','x')")
+    c.execute("INSERT INTO tracked_tracks (artist,title,status,added_at,updated_at)"
+              " VALUES ('C','D','COMPLETED','x','x')")
+    c.commit()
+    c.close()
+
+    conn = DatabaseConnection(db)
+    conn.initialize()
+    with conn.get_connection() as c:
+        assert c.execute("SELECT COUNT(*) FROM tracked_tracks").fetchone()[0] == 2
+        rows = dict(c.execute("SELECT artist, status FROM tracked_tracks").fetchall())
+        assert rows == {"A": "NEW", "C": "COMPLETED"}
+        cols = {r[1] for r in c.execute("PRAGMA table_info(tracked_tracks)")}
+        assert set(TRACKED_STATE_COLUMNS) <= cols
+    # The duplicate that was merged away is named in the v2 report, not in v1's.
+    assert _user_version(db) == 2
+    lines = (tmp_path / "migration-duplicates-2.txt").read_text(encoding="utf-8").splitlines()
+    assert lines == ["2\tA\tB"]
+    assert not (tmp_path / "migration-duplicates-1.txt").exists()
+
+
+def test_tracked_tracks_gets_the_retry_columns_with_legacy_defaults(tmp_path):
+    """Legacy rows arrive with no attempt counted and no retry scheduled."""
+    db = _track(_v1_db(tmp_path), [("A", "B", "PENDING", None)])
+    DatabaseConnection(db).initialize()
+
+    assert _columns(db, "tracked_tracks") >= set(TRACKED_STATE_COLUMNS)
+    with DatabaseConnection(db).get_connection() as c:
+        row = c.execute(
+            "SELECT attempts, last_attempt_at, next_retry_at, last_error,"
+            " lidarr_checked_at FROM tracked_tracks"
+        ).fetchone()
+        assert tuple(row) == (0, None, None, None, None)
+        # ``attempts`` is NOT NULL DEFAULT 0, so a row that names no attempts has one.
+        c.execute(
+            "INSERT INTO tracked_tracks (artist,title,status,added_at,updated_at)"
+            " VALUES ('X','Y','NEW','x','x')"
+        )
+        assert c.execute(
+            "SELECT attempts FROM tracked_tracks WHERE artist = 'X'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("winner,loser", list(zip(STATUS_PRECEDENCE, STATUS_PRECEDENCE[1:])))
+def test_status_precedence_decides_which_row_survives(tmp_path, winner, loser):
+    """The weaker status has the lower id, so only the precedence can pick the winner."""
+    db = _track(
+        _v1_db(tmp_path),
+        [("A", "B", loser, "mbid-loser"), ("A", "B", winner, "mbid-winner")],
+    )
+    DatabaseConnection(db).initialize()
+
+    assert _tracked_count(db) == 1
+    row = _tracked_rows(db)[0]
+    assert (row[3], row[4]) == ("B", winner)
+    assert row[1] == "mbid-winner", "the winner keeps its own attributes"
+    assert (tmp_path / "migration-duplicates-2.txt").read_text(
+        encoding="utf-8"
+    ).splitlines() == ["1\tA\tB"]
+
+
+def test_dedupe_keeps_the_lowest_id_when_the_statuses_tie_and_folds_case(tmp_path):
+    """Same status, three spellings of the natural key: the lowest id survives."""
+    db = _track(
+        _v1_db(tmp_path),
+        [
+            ("Autechre", "Amber", "NEW", "mbid-1"),
+            ("autechre", "AMBER", "NEW", "mbid-2"),
+            ("AUTECHRE", "amber", "NEW", "mbid-3"),
+        ],
+    )
+    DatabaseConnection(db).initialize()
+
+    assert _tracked_count(db) == 1
+    assert _tracked_rows(db) == [(1, "mbid-1", "Autechre", "Amber", "NEW", 0, None)]
+
+
+def test_merge_takes_the_highest_attempts_and_the_winners_last_error(tmp_path):
+    """``attempts = MAX(attempts)``; ``last_error`` follows the winner, not the max."""
+    db = tmp_path / "merge.db"
+    c = sqlite3.connect(db)
+    c.executescript("""
+    CREATE TABLE tracked_tracks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, recording_mbid TEXT, artist TEXT NOT NULL,
+        title TEXT NOT NULL, source TEXT DEFAULT 'listenbrainz',
+        status TEXT DEFAULT 'PENDING', added_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0, last_attempt_at TEXT, next_retry_at TEXT,
+        last_error TEXT, lidarr_checked_at TEXT);
+    """)
+    c.executemany(
+        "INSERT INTO tracked_tracks (artist,title,status,attempts,last_error,"
+        " added_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+        [
+            # id 1: five failed attempts, the loser on status
+            ("A", "B", "FAILED", 5, "yt-dlp timed out", NOW, NOW),
+            # id 2: completed, but only two attempts of its own
+            ("A", "B", "COMPLETED", 2, "tagging failed", NOW, NOW),
+        ],
+    )
+    c.commit()
+    c.execute("BEGIN IMMEDIATE")
+    dropped = migrations._merge_tracked_tracks(c)
+    c.commit()
+    try:
+        assert c.execute("SELECT COUNT(*) FROM tracked_tracks").fetchone()[0] == 1
+        row = c.execute(
+            "SELECT id, status, attempts, last_error FROM tracked_tracks"
+        ).fetchone()
+        assert tuple(row) == (2, "COMPLETED", 5, "tagging failed")
+        assert dropped == ["1\tA\tB"]
+    finally:
+        c.close()
+
+
+def test_unique_natural_index_rejects_a_duplicate_tracked_track(tmp_path):
+    conn = DatabaseConnection(tmp_path / "t.db")
+    conn.initialize()
+    with conn.get_connection() as c:
+        c.execute(
+            "INSERT INTO tracked_tracks (artist,title,status,added_at,updated_at)"
+            " VALUES ('A','B','NEW','x','x')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            c.execute(
+                "INSERT INTO tracked_tracks (artist,title,status,added_at,updated_at)"
+                " VALUES ('a','b','NEW','y','y')"
+            )
+
+
+def test_queue_index_covers_status_and_next_retry_at(tmp_path):
+    """The worker picks its next track with ``ORDER BY next_retry_at``."""
+    db = tmp_path / "t.db"
+    DatabaseConnection(db).initialize()
+    c = sqlite3.connect(db)
+    try:
+        assert c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'ix_tracked_queue'"
+        ).fetchone()
+        assert [row[2] for row in c.execute("PRAGMA index_info(ix_tracked_queue)")] == [
+            "status",
+            "next_retry_at",
+        ]
+    finally:
+        c.close()
+
+
+def test_a_v1_database_reaches_v2_without_v1_running_again(tmp_path, monkeypatch):
+    """A database already at v1 must be carried to v2 by the new step alone.
+
+    The version check is what makes this true, and it is exactly the case a
+    deployed database is in: v1 already ran and must never run twice.
+    """
+    db = _track(_v1_db(tmp_path), [("A", "B", "PENDING", None)])
+
+    def v1_must_not_run(*_args, **_kwargs):
+        raise AssertionError("migration v1 ran again on an already migrated database")
+
+    monkeypatch.setattr(migrations, "_migrate_v1", v1_must_not_run)
+
+    DatabaseConnection(db).initialize()
+
+    assert _user_version(db) == 2
+    assert _tracked_rows(db) == [(1, None, "A", "B", "NEW", 0, None)]
+
+
+def test_running_the_v2_step_twice_changes_nothing(tmp_path):
+    db = _track(
+        _v1_db(tmp_path),
+        [("A", "B", "PENDING", None), ("A", "B", "COMPLETED", "mbid-2")],
+    )
+    conn = DatabaseConnection(db)
+    with conn.get_connection() as c:
+        assert migrations.apply_migrations(c, db) == [2]
+    before = _snapshot(db)
+
+    with conn.get_connection() as c:
+        assert migrations.apply_migrations(c, db) == []
+
+    assert _snapshot(db) == before
+    assert _user_version(db) == 2
+
+
+def test_artists_is_rebuilt_without_fallback_done_and_keeps_its_rows(tmp_path):
+    """``fallback_done`` is dropped by rebuilding, not by ``DROP COLUMN``."""
+    db = _v1_db(tmp_path)
+    c = sqlite3.connect(db)
+    c.execute(
+        "INSERT INTO artists (artist_name, added_at, fallback_done, recommended_tracks)"
+        " VALUES ('Autechre','2026-01-01',1,'[\"Amber\"]')"
+    )
+    c.commit()
+    c.close()
+
+    DatabaseConnection(db).initialize()
+
+    assert "fallback_done" not in _columns(db, "artists")
+    with DatabaseConnection(db).get_connection() as c:
+        assert tuple(
+            c.execute(
+                "SELECT artist_name, added_at, recommended_tracks FROM artists"
+            ).fetchone()
+        ) == ("Autechre", "2026-01-01", '["Amber"]')
+        # The rebuild leaves no scaffolding table behind.
+        assert not c.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'artists_v2'"
+        ).fetchone()
+
+
+def test_each_migration_writes_its_own_report(tmp_path):
+    """A v0 -> v2 run drops file paths in v1's report and tracks in v2's.
+
+    One file per version: an operator reading ``migration-duplicates-1.txt`` must
+    be looking at audio paths v1 unindexed, not at v2's merged duplicate tracks,
+    and neither migration may overwrite the other's findings.
+    """
+    db = _legacy_db_with(
+        tmp_path / "both.db",
+        [
+            ("Cup of Joe", "Multo", None, "/music/a.mp3"),
+            ("cup of joe", "Multo", None, "/music/b.mp3"),
+        ],
+    )
+    c = sqlite3.connect(db)
+    c.executescript("""
+    CREATE TABLE tracked_tracks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, recording_mbid TEXT, artist TEXT NOT NULL,
+        title TEXT NOT NULL, source TEXT DEFAULT 'listenbrainz', status TEXT DEFAULT 'PENDING',
+        added_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(recording_mbid, artist, title));
+    """)
+    c.executemany(
+        "INSERT INTO tracked_tracks (artist,title,status,added_at,updated_at)"
+        " VALUES ('Artist','Song',?,?,?)",
+        [("PENDING", NOW, NOW), ("COMPLETED", NOW, NOW)],
+    )
+    c.commit()
+    c.close()
+
+    DatabaseConnection(db).initialize()
+
+    assert (tmp_path / "migration-duplicates-1.txt").read_text(
+        encoding="utf-8"
+    ).splitlines() == ["2\tcup of joe\tMulto\t/music/b.mp3"]
+    assert (tmp_path / "migration-duplicates-2.txt").read_text(
+        encoding="utf-8"
+    ).splitlines() == ["1\tArtist\tSong"]

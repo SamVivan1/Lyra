@@ -38,44 +38,6 @@ class TrackStateManager:
         """Return current UTC timestamp in ISO format."""
         return datetime.now(timezone.utc).isoformat()
 
-    def _tracked_track_exists(
-        self,
-        recording_mbid: Optional[str],
-        artist: str,
-        title: str
-    ) -> bool:
-        """
-        Check if a track is already being tracked.
-        
-        Args:
-            recording_mbid: MusicBrainz recording ID (can be None)
-            artist: Artist name
-            title: Track title
-            
-        Returns:
-            True if track exists in tracked_tracks, False otherwise
-        """
-        try:
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                if recording_mbid:
-                    cursor.execute(
-                        'SELECT 1 FROM tracked_tracks WHERE recording_mbid = ? LIMIT 1',
-                        (recording_mbid,)
-                    )
-                    if cursor.fetchone():
-                        return True
-                
-                cursor.execute('''
-                    SELECT 1 FROM tracked_tracks 
-                    WHERE artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE 
-                    LIMIT 1
-                ''', (artist, title))
-                return cursor.fetchone() is not None
-        except sqlite3.Error as e:
-            logger.error(f"Failed to check tracked track existence: {e}")
-            return False
-
     def add_tracked_track(
         self,
         recording_mbid: Optional[str],
@@ -84,43 +46,52 @@ class TrackStateManager:
         source: str = 'listenbrainz'
     ) -> bool:
         """
-        Add a track to the tracked_tracks table.
-        
-        Prevents duplicates by checking if track already exists.
-        
+        Add a track to the tracked_tracks table, once.
+
+        Duplicate detection is the statement's job, not a separate read: the
+        unique index on ``artist COLLATE NOCASE, title COLLATE NOCASE`` decides,
+        so two processes inserting the same track at the same time cannot both
+        believe the track was absent. A row already in the table is left exactly
+        as it is -- it may be mid-retry, and re-adding it must not reset that.
+
         Args:
-            recording_mbid: Optional MusicBrainz recording ID
+            recording_mbid: Optional MusicBrainz recording ID (an attribute, not
+                part of the key: the same recording id does not make two
+                different artist + title pairs the same track)
             artist: Artist name
             title: Track title
-        Returns:
-            True if successfully added, False if already exists
-        """
-        if self._tracked_track_exists(recording_mbid, artist, title):
-            logger.debug(f"Track '{artist} - {title}' already being tracked")
-            return False
+            source: Where the track came from ('listenbrainz' or 'manual')
 
+        Returns:
+            True if the row was inserted, False if the track was already tracked
+        """
         try:
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
                 now = self._now_iso()
                 cursor.execute('''
-                    INSERT INTO tracked_tracks 
+                    INSERT INTO tracked_tracks
                     (recording_mbid, artist, title, source, status, added_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'PENDING', ?, ?)
+                    VALUES (?, ?, ?, ?, 'NEW', ?, ?)
+                    ON CONFLICT DO NOTHING
                 ''', (recording_mbid, artist, title, source, now, now))
                 conn.commit()
-                logger.debug(f"Added tracked track: '{artist} - {title}'")
-                return cursor.rowcount > 0
+                inserted = cursor.rowcount > 0
         except sqlite3.IntegrityError:
-            logger.debug(f"Track already exists in tracked_tracks: '{artist} - {title}'")
+            logger.debug(f"Track failed the constraints of tracked_tracks: '{artist} - {title}'")
             return False
         except sqlite3.Error as e:
             logger.error(f"Failed to add tracked track '{artist} - {title}': {e}")
             return False
+        if inserted:
+            logger.debug(f"Added tracked track: '{artist} - {title}'")
+        else:
+            logger.debug(f"Track '{artist} - {title}' already being tracked")
+        return inserted
 
     def get_pending_tracked_tracks(self, hours: int = 24) -> List[Dict[str, Any]]:
         """
-        Get tracked tracks that are pending and older than specified hours.
+        Get tracked tracks that are new (queued) and older than specified hours.
         
         Args:
             hours: Number of hours to check against (default: 24)
@@ -135,7 +106,7 @@ class TrackStateManager:
                 cursor.execute('''
                     SELECT id, recording_mbid, artist, title, source, added_at 
                     FROM tracked_tracks 
-                    WHERE status = "PENDING"
+                    WHERE status = 'NEW'
                     ORDER BY added_at ASC
                 ''')
                 rows = cursor.fetchall()
