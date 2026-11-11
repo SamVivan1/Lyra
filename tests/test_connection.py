@@ -1,5 +1,6 @@
 import logging
 import sqlite3
+import threading
 
 import pytest
 
@@ -220,3 +221,56 @@ def test_get_connection_does_not_leak_connection_when_pragma_fails(tmp_path, mon
         # ProgrammingError == "Cannot operate on a closed database".
         with pytest.raises(sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
+
+
+def test_two_connections_write_alternately_without_database_is_locked(tmp_path):
+    """§10's mandatory test for goal 2: WAL + ``busy_timeout``, writing in turn.
+
+    ``--loop`` and ``--interactive`` are two processes writing the same file.
+    Only a reader-versus-writer test existed, so the mechanism behind goal 2 had
+    no end-to-end test: this one alternates the writers twenty times and then
+    makes one of them wait on the other's open write transaction. Without WAL and
+    a busy timeout the waiting writer dies with ``database is locked``.
+    """
+    db_path = tmp_path / "t.db"
+    first = DatabaseConnection(db_path)
+    first.initialize()
+    second = DatabaseConnection(db_path)
+
+    with first.get_connection() as a, second.get_connection() as b:
+        # The mechanism, asserted directly rather than inferred from success.
+        for conn in (a, b):
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] > 0
+
+        a.execute("CREATE TABLE writes (writer TEXT, n INTEGER)")
+        a.commit()
+
+        # Alternate the writers: each commits before the other starts.
+        for n in range(20):
+            writer, name = (a, "a") if n % 2 == 0 else (b, "b")
+            writer.execute("INSERT INTO writes VALUES (?, ?)", (name, n))
+            writer.commit()
+
+        # Now real contention: b holds the write lock and a has to wait for it.
+        errors = []
+
+        def contended_write():
+            try:
+                a.execute("INSERT INTO writes VALUES ('a', 100)")
+                a.commit()
+            except sqlite3.Error as e:  # reported by the assertion below
+                errors.append(e)
+
+        b.isolation_level = None
+        b.execute("BEGIN IMMEDIATE")
+        b.execute("INSERT INTO writes VALUES ('b', 101)")
+        worker = threading.Thread(target=contended_write)
+        worker.start()
+        worker.join(timeout=0.2)  # a is now waiting on b's lock
+        b.execute("COMMIT")  # releases it, so a may proceed
+        worker.join(timeout=10)
+
+        assert not worker.is_alive(), "the waiting writer must not deadlock"
+        assert errors == [], f"a concurrent write failed: {errors}"
+        assert a.execute("SELECT COUNT(*) FROM writes").fetchone()[0] == 22
