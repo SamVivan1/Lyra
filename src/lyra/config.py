@@ -4,6 +4,7 @@ Configuration management for Lyra Music Automation.
 Loads configuration from environment variables and optionally from a local .env file.
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -12,6 +13,8 @@ from dotenv import load_dotenv
 
 # Load .env from the current working directory when the package is imported.
 load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
+
+logger = logging.getLogger(__name__)
 
 
 class Config:
@@ -88,6 +91,25 @@ class Config:
         if missing:
             raise ValueError(
                 f"Missing required environment variables: {', '.join(missing)}"
+            )
+
+    @classmethod
+    def validate_interactive(cls) -> None:
+        """
+        Validate only what the interactive manual-download mode needs.
+
+        A manual download talks to neither ListenBrainz nor Lidarr, so requiring
+        their credentials would lock the operator out of the one mode that needs
+        no account. Nothing here is fatal: a library path that does not exist
+        yet is worth saying out loud, because the downloader falls back to
+        ``DOWNLOAD_PATH`` and the file would land somewhere unexpected.
+
+        Unlike :meth:`validate`, this never raises.
+        """
+        if not any(os.path.exists(path) for path in cls.library_paths()):
+            logger.warning(
+                f"No configured library path exists ({cls.LIBRARY_PATH}); manual "
+                f"downloads will be written to {cls.DOWNLOAD_PATH} until one does"
             )
 
     @classmethod

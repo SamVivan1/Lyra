@@ -37,16 +37,45 @@ class InteractiveDownloader:
     - Database integration
     """
 
-    def __init__(self):
-        """Initialize InteractiveDownloader."""
-        if HAS_RICH:
+    def __init__(
+        self,
+        downloader: Optional[Downloader] = None,
+        db_integration: Optional[CLIDatabaseIntegration] = None,
+        console: Optional[Any] = None,
+        dry_run: bool = False
+    ):
+        """
+        Initialize InteractiveDownloader.
+
+        Every collaborator that touches the network or the database can be
+        injected, so a test exercises the real class without either. The
+        arguments are keyword-friendly on purpose: the CLI passes the database
+        integration it has already initialised.
+
+        Args:
+            downloader: Downloader instance. Creates one if None, carrying the
+                dry-run flag so a simulation reaches no subprocess.
+            db_integration: CLIDatabaseIntegration instance. Creates one if None.
+            console: Rich console. Creates one if None and ``rich`` is available.
+            dry_run: If True, nothing is downloaded, tagged or recorded
+        """
+        self.dry_run = dry_run
+
+        if console is not None:
+            self.console = console
+        elif HAS_RICH:
             self.console = Console()
         else:
             self.console = None
-        
-        self.downloader = Downloader()
+
+        self.downloader = (
+            downloader if downloader is not None else Downloader(dry_run=dry_run)
+        )
         self.musicbrainz_client = MusicBrainzClient()
-        self.db_integration = CLIDatabaseIntegration()
+        self.db_integration = (
+            db_integration if db_integration is not None
+            else CLIDatabaseIntegration(dry_run=dry_run)
+        )
 
     def _print(self, message: str, style: Optional[str] = None) -> None:
         """Print message with optional styling."""
@@ -237,6 +266,16 @@ class InteractiveDownloader:
         if not HAS_RICH:
             self._print("Warning: Install 'rich' for better CLI experience: pip install rich")
 
+        if self.dry_run:
+            # Printed once, before the menu: everything on this screen then
+            # looks like a simulation, and the operator can stop expecting files.
+            self._print(
+                "[bold yellow]DRY RUN[/bold yellow] — nothing will be downloaded, "
+                "tagged or recorded."
+                if HAS_RICH else
+                "DRY RUN — nothing will be downloaded, tagged or recorded."
+            )
+
         try:
             while True:
                 actions = [
@@ -343,10 +382,19 @@ class InteractiveDownloader:
             album_artist=album_artist,
             year=year,
             release_date=release_date,
-            track_number=track_number
+            track_number=track_number,
+            dry_run=self.dry_run
         )
 
-        if success:
+        if success and self.dry_run:
+            # ``download_manual`` reports True for a simulated download, and
+            # recording that would put a track in the library that is not on
+            # disk. Say so plainly instead of claiming a download happened.
+            self._print(
+                "[bold yellow]DRY RUN[/bold yellow] — nothing was downloaded or recorded."
+                if HAS_RICH else "\nDRY RUN — nothing was downloaded or recorded."
+            )
+        elif success:
             self.db_integration.record_manual_download(artist, title, album=album)
             self._print(
                 "[bold green]✓ Download successful![/bold green]" if HAS_RICH else "\n✓ Download successful!"

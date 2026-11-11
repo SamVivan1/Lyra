@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from .config import Config
 from .logging_config import setup_logger, configure_root_logger
@@ -89,6 +90,68 @@ def _startup_error_message(error: Exception, db_path: str) -> str:
         f"Could not open the database at {db_path}: {error}. "
         "Check that the path is a writable file that no other process is using."
     )
+
+
+def _open_initialised_database(db_path: str) -> Optional[DatabaseConnection]:
+    """
+    Open and initialise the database, reporting a failure instead of raising.
+
+    Every mode meets the same failures here -- a corrupt file, an unwritable
+    path, a database another process is holding -- and the operator needs the
+    same actionable line for each, so the handling lives in one place.
+
+    Args:
+        db_path: Path of the database file.
+
+    Returns:
+        The initialised connection, or None when startup must stop.
+    """
+    connection = DatabaseConnection(db_path)
+    try:
+        connection.initialize()
+    except (DatabaseCorruptError, DatabaseFileError, sqlite3.Error) as e:
+        # Without this the operator meets a raw traceback instead of the advice
+        # these errors were written to carry -- the `lyra --repair-db` hint, the
+        # unwritable path, or the busy database. Reporting only: never repair.
+        logger.error(_startup_error_message(e, db_path))
+        return None
+    return connection
+
+
+def run_interactive_mode(dry_run: bool = False) -> int:
+    """
+    Run the interactive manual-download CLI, returning the process exit code.
+
+    The database is initialised here, before the downloader is built: the
+    integration it holds is uninitialised until then, so on a fresh database the
+    first record would otherwise fail with ``no such table``. The initialised
+    connection is handed to that integration rather than to a second one.
+
+    Args:
+        dry_run: If True, nothing is downloaded, tagged or recorded.
+
+    Returns:
+        0 on a clean exit, 1 when the database cannot be opened.
+    """
+    from .cli import InteractiveDownloader
+    from .cli.db_integration import CLIDatabaseIntegration
+
+    # Only what a manual download needs: this mode talks to neither
+    # ListenBrainz nor Lidarr, so the batch credentials are not asked for.
+    Config.validate_interactive()
+
+    db_connection = _open_initialised_database(Config.DB_PATH)
+    if db_connection is None:
+        return 1
+
+    downloader = InteractiveDownloader(
+        db_integration=CLIDatabaseIntegration(
+            db_connection=db_connection, dry_run=dry_run
+        ),
+        dry_run=dry_run,
+    )
+    downloader.run()
+    return 0
 
 
 def main() -> int:
@@ -194,29 +257,22 @@ Examples:
     if args.repair_db:
         return repair_database_mode(Config.DB_PATH)
 
+    # Interactive mode comes first and validates only itself: it is the one mode
+    # a manual download needs, and it needs no ListenBrainz or Lidarr account --
+    # so the batch credentials must not stand between the operator and it.
+    if args.interactive:
+        return run_interactive_mode(dry_run=args.dry_run)
+
     try:
-        # Validate configuration
+        # Validate configuration for the batch modes
         Config.validate()
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
         return 1
 
-    # Interactive mode
-    if args.interactive:
-        from .cli import InteractiveDownloader
-        downloader = InteractiveDownloader()
-        downloader.run()
-        return 0
-
     # Initialize components
-    db_connection = DatabaseConnection(Config.DB_PATH)
-    try:
-        db_connection.initialize()
-    except (DatabaseCorruptError, DatabaseFileError, sqlite3.Error) as e:
-        # Without this the operator meets a raw traceback instead of the advice
-        # these errors were written to carry -- the `lyra --repair-db` hint, the
-        # unwritable path, or the busy database. Reporting only: never repair.
-        logger.error(_startup_error_message(e, Config.DB_PATH))
+    db_connection = _open_initialised_database(Config.DB_PATH)
+    if db_connection is None:
         return 1
     # The dry-run flag is a property of the stores the orchestrator builds, so
     # it is handed over once here: every write path below then inherits it.
