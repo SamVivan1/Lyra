@@ -10,6 +10,7 @@ import glob
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+import mutagen
 from mutagen import File as MutagenFile
 
 from .connection import DatabaseConnection
@@ -18,6 +19,74 @@ from .state import StateManager
 logger = logging.getLogger(__name__)
 
 AUDIO_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wav')
+
+# Tag keys that may carry the MusicBrainz recording MBID, most specific first.
+# None of these is exposed through mutagen's EasyID3 view, so the file has to
+# be opened with the non-easy API to read them.
+RECORDING_MBID_TAG_KEYS = (
+    'musicbrainz_trackid',
+    'TXXX:MusicBrainz Recording Id',
+    'UFID:http://musicbrainz.org',
+)
+
+
+def _coerce_mbid_value(value: Any) -> Optional[str]:
+    """
+    Normalise a raw tag value into a stripped MBID string.
+
+    Handles the shapes mutagen produces: a UFID frame object carrying the
+    payload in ``.data`` as bytes, a TXXX frame object carrying it in ``.text``,
+    a list/tuple of values, and a plain string.
+
+    Args:
+        value: Raw tag value from the non-easy mutagen API
+
+    Returns:
+        Stripped MBID string, or None when there is no usable value
+    """
+    if hasattr(value, 'data'):
+        value = value.data
+    elif hasattr(value, 'text'):
+        value = value.text
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if isinstance(value, bytes):
+        value = value.decode('utf-8', errors='replace')
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
+
+
+def read_recording_mbid(file_path: str) -> Optional[str]:
+    """
+    Read the MusicBrainz recording MBID from an audio file.
+
+    Uses the non-easy mutagen API because ``musicbrainz_recordingid`` is not a
+    valid EasyID3 key, which silently produced None for every track.
+
+    Args:
+        file_path: Path to the audio file
+
+    Returns:
+        The recording MBID, or None when absent or unreadable
+    """
+    try:
+        audio = mutagen.File(file_path)
+        if audio is None:
+            return None
+
+        tags = getattr(audio, 'tags', None)
+        if tags is None:
+            tags = audio
+
+        for key in RECORDING_MBID_TAG_KEYS:
+            mbid = _coerce_mbid_value(tags.get(key))
+            if mbid:
+                return mbid
+        return None
+    except Exception as e:
+        logger.debug(f"Failed to read recording MBID from {file_path}: {e}")
+        return None
 
 
 class LibraryScanner:
@@ -120,11 +189,11 @@ class LibraryScanner:
                 metadata['artist'] = self._first_tag(audio.get('artist'))
                 metadata['title'] = self._first_tag(audio.get('title'))
                 metadata['album'] = self._first_tag(audio.get('album'))
-                metadata['recording_mbid'] = self._first_tag(
-                    audio.get('musicbrainz_recordingid')
-                )
         except Exception as e:
             logger.debug(f"Failed to read ID3 tags from {file_path}: {e}")
+
+        # The MBID is not visible through the easy API - read it separately.
+        metadata['recording_mbid'] = read_recording_mbid(file_path)
 
         # Fallback: infer from path if tags missing
         if not metadata['artist'] or not metadata['title']:
